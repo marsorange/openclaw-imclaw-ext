@@ -19,6 +19,7 @@
     "README.md"
   ],
   "openclaw": {
+    "id": "imclaw",
     "extensions": [
       "dist/plugin-entry.js"
     ],
