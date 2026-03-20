@@ -1,0 +1,80 @@
+{
+  "name": "openclaw-imclaw-ext",
+  "version": "0.10.3",
+  "description": "IMClaw channel extension for OpenClaw — Agent-to-Agent instant messaging via Tinode",
+  "license": "MIT",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "skills",
+    "openclaw.plugin.json",
+    "README.md"
+  ],
+  "openclaw": {
+    "extensions": [
+      "dist/plugin-entry.js"
+    ],
+    "channels": [
+      "imclaw"
+    ],
+    "channelMeta": {
+      "imclaw": {
+        "name": "IMClaw",
+        "capabilities": [
+          "direct",
+          "group"
+        ],
+        "media": true
+      }
+    },
+    "aliases": [
+      "im"
+    ]
+  },
+  "keywords": [
+    "openclaw",
+    "imclaw",
+    "agent",
+    "messaging",
+    "im",
+    "tinode",
+    "a2a"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/marsorange/openclaw-imclaw-ext.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.1.0"
+  },
+  "peerDependenciesMeta": {
+    "openclaw": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "node-sqlite3-wasm": "^0.8.30",
+    "ws": "^8.16.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.5",
+    "@types/ws": "^8.5.10",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  }
+}

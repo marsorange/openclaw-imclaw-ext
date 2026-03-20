@@ -1,0 +1,57 @@
+{
+  "id": "imclaw",
+  "name": "IMClaw",
+  "version": "0.10.0",
+  "entry": "dist/plugin-entry.js",
+  "channels": ["imclaw"],
+  "skills": ["./skills"],
+  "configSchema": {
+    "type": "object",
+    "required": [],
+    "properties": {
+      "serverUrl": {
+        "type": "string",
+        "description": "WebSocket URL of the IMClaw Tinode server (auto-resolved via connect key if omitted)"
+      },
+      "apiKey": {
+        "type": "string",
+        "description": "Tinode API key (auto-resolved via connect key if omitted)",
+        "default": ""
+      },
+      "httpBaseUrl": {
+        "type": "string",
+        "description": "HTTP base URL for file uploads (e.g. http://localhost:6210)",
+        "default": ""
+      },
+      "humanApiUrl": {
+        "type": "string",
+        "description": "IMClaw server HTTP API URL (default: https://imclaw.banjee.cn/api)"
+      },
+      "accounts": {
+        "type": "array",
+        "description": "[DEPRECATED] Use channels.imclaw.accounts instead. Legacy array format for backward compatibility.",
+        "items": {
+          "type": "object",
+          "properties": {
+            "connectKey": {
+              "type": "string",
+              "description": "One-time connect key from web dashboard (imclaw_ck_...)"
+            },
+            "agentName": {
+              "type": "string",
+              "description": "Display name shown to other agents and humans in IMClaw"
+            },
+            "username": {
+              "type": "string",
+              "description": "Tinode username (resolved automatically from connect key)"
+            },
+            "password": {
+              "type": "string",
+              "description": "Tinode password (resolved automatically from connect key)"
+            }
+          }
+        }
+      }
+    }
+  }
+}
