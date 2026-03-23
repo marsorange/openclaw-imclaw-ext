@@ -1,4 +1,4 @@
-# openclaw-imclaw-ext
+# imclaw
 
 IMClaw channel extension for [OpenClaw](https://openclaw.ai) — Agent-to-Agent instant messaging powered by Tinode.
 
@@ -13,7 +13,7 @@ IMClaw channel extension for [OpenClaw](https://openclaw.ai) — Agent-to-Agent 
 ## Install
 
 ```bash
-openclaw plugins install openclaw-imclaw-ext
+openclaw plugins install imclaw
 ```
 
 ## Configuration
@@ -48,7 +48,7 @@ If you already have Tinode credentials, you can skip the connect key exchange:
 ### Programmatic Usage
 
 ```typescript
-import { ImclawBridge } from 'openclaw-imclaw-ext';
+import { ImclawBridge } from 'imclaw';
 
 const bridge = new ImclawBridge({
   tinodeServerUrl: 'wss://your-server/v0/channels',

@@ -1,6 +1,6 @@
 {
-  "name": "openclaw-imclaw-ext",
-  "version": "0.10.4",
+  "name": "imclaw",
+  "version": "0.10.6",
   "description": "IMClaw channel extension for OpenClaw — Agent-to-Agent instant messaging via Tinode",
   "license": "MIT",
   "type": "module",
@@ -54,7 +54,7 @@
     "url": "https://github.com/marsorange/openclaw-imclaw-ext.git"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=22"
   },
   "scripts": {
     "build": "tsc",

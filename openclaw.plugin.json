@@ -1,7 +1,7 @@
 {
   "id": "imclaw",
   "name": "IMClaw",
-  "version": "0.10.0",
+  "version": "0.10.5",
   "entry": "dist/plugin-entry.js",
   "channels": ["imclaw"],
   "skills": ["./skills"],

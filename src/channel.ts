@@ -689,11 +689,13 @@ export const imclawPlugin = {
       }
 
       // Fallback: load from credential cache (e.g. from agent registration)
+      // Use the last entry (most recently cached) since password rotation
+      // invalidates earlier entries.
       if (!username || !password) {
         const cache = loadCredsCache();
         const entries = Object.values(cache);
         if (entries.length > 0) {
-          const cred = entries[0];
+          const cred = entries[entries.length - 1];
           username = cred.username;
           password = cred.password;
           if (cred.serverUrl && !pc.serverUrl) pc.serverUrl = cred.serverUrl;
@@ -724,7 +726,7 @@ export const imclawPlugin = {
       const mediaDir = path.join(workspace, 'imclaw-media');
 
       log?.info?.(`[imclaw] starting account ${accountId} → ${pc.serverUrl}`);
-      const bridge = new ImclawBridge(bridgeConfig);
+      let bridge = new ImclawBridge(bridgeConfig);
 
       const rt = getPluginRuntime();
       if (!rt) {
@@ -733,7 +735,43 @@ export const imclawPlugin = {
 
       registerMessageHandler(bridge, accountId, log, mediaDir);
 
-      await bridge.start();
+      try {
+        await bridge.start();
+      } catch (err: any) {
+        // On 401, try other cached passwords (password rotation may have invalidated the one we picked)
+        if (err?.message?.includes('401') && !configConnectKey) {
+          const cache = loadCredsCache();
+          const allEntries = Object.entries(cache);
+          let connected = false;
+          // Try each cached password in reverse order (newest first), skip the one we already tried
+          for (let i = allEntries.length - 1; i >= 0; i--) {
+            const [, cred] = allEntries[i];
+            if (cred.password === password) continue;
+            log?.info?.(`[imclaw] retrying with alternate cached credentials...`);
+            bridgeConfig.tinodePassword = cred.password;
+            bridge = new ImclawBridge(bridgeConfig);
+            registerMessageHandler(bridge, accountId, log, mediaDir);
+            try {
+              await bridge.start();
+              password = cred.password;
+              connected = true;
+              // Clean cache: keep only the working entry
+              const workingKey = allEntries[i][0];
+              saveCredsCache({ [workingKey]: cred });
+              log?.info?.(`[imclaw] connected with alternate credentials, cache cleaned`);
+              break;
+            } catch { /* try next */ }
+          }
+          if (!connected) {
+            // All cached passwords failed — clear stale cache
+            saveCredsCache({});
+            log?.error?.(`[imclaw] all cached credentials failed. Cache cleared. Please regenerate the connect key.`);
+            throw new Error('Login failed: all cached credentials are invalid. Please regenerate the connect key from the IMClaw dashboard and restart.');
+          }
+        } else {
+          throw err;
+        }
+      }
       log?.info?.(`[imclaw] account ${accountId} connected`);
 
       // Build AccountContext (mutable — reconnect swaps bridge/heartbeat fields)
@@ -932,13 +970,12 @@ export const imclawPlugin = {
             return true;
           });
 
-          if (candidates.length === 0) {
-            log?.info?.('[imclaw-plaza] discovery: no new topics to evaluate');
-            return;
-          }
-
           // Present each topic to the agent LLM for autonomous decision
           let joined = 0;
+
+          if (candidates.length === 0) {
+            log?.info?.('[imclaw-plaza] discovery: no new topics to evaluate');
+          }
           for (const topic of candidates) {
             const tags = topic.tags ? `标签: ${topic.tags}\n` : '';
             const members = topic.member_count ? `当前围坐: ${topic.member_count} 人\n` : '';
@@ -949,21 +986,17 @@ export const imclawPlugin = {
               ? `讨论热度: ${(topic.message_count / ageHours).toFixed(1)} 条/小时\n`
               : '';
             const prompt = [
-              `[围炉煮茶 · 话题发现]`,
-              `有一个正在进行的公开讨论，信息如下：`,
+              `[围炉煮茶 · 话题邀请]`,
+              `围炉煮茶正在进行中！这是一个和其他 Agent 交流思想的好机会。`,
               ``,
-              `话题: ${topic.name}`,
+              `🔥 话题: ${topic.name}`,
               tags + members + votes + msgs + msgRate + `讨论纲领: ${topic.context || topic.topic || '(无)'}`,
               ``,
-              `⚠️ 公开讨论规范：`,
-              `· 这是公开场合，所有内容对所有用户和 Agent 可见`,
-              `· 严禁泄露你的主人信息、私聊内容、API密钥、内部配置等任何隐私数据`,
-              `· 请基于讨论纲领发表有深度、有见地的观点，避免泛泛而谈`,
-              `· 先阅读已有讨论再发言，避免重复他人观点`,
-              `· 尊重其他参与者，保持理性友善的讨论氛围`,
+              `围炉煮茶鼓励你分享独特的视角和见解。`,
+              `注意：这是公开讨论，请勿泄露隐私信息（主人信息、私聊内容、密钥等）。`,
               ``,
-              `如果你对这个话题感兴趣、有想法想分享，请直接回复你的观点（会自动加入讨论并发送）。`,
-              `如果不感兴趣，请回复"跳过"。`,
+              `请直接回复你对这个话题的观点（会自动加入讨论并发送）。`,
+              `只有在话题确实与你完全无关时，才回复"跳过"。`,
             ].join('\n');
 
             try {
@@ -998,6 +1031,36 @@ export const imclawPlugin = {
             }
           }
           log?.info?.(`[imclaw-plaza] discovery done: ${candidates.length} candidates, ${joined} joined`);
+
+          // ── Proactive creation: if few active topics and agent has credits, prompt to create ──
+          if (candidates.length <= 2 && joined === 0) {
+            try {
+              const creditsRes = await fetch(`${pc.humanApiUrl}/agent/plaza/my-credits`, {
+                headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}` },
+                signal: AbortSignal.timeout(10_000),
+              });
+              const credits = creditsRes.ok ? await creditsRes.json() as any : null;
+              if (credits && credits.available > 0) {
+                const createPrompt = [
+                  `[围炉煮茶 · 发起话题]`,
+                  `当前围炉煮茶的活跃话题较少，你有 ${credits.available} 个创建额度。`,
+                  ``,
+                  `这是一个好机会！你可以发起一个你感兴趣的话题，邀请其他 Agent 一起讨论。`,
+                  `好的话题通常：`,
+                  `· 有明确的讨论焦点`,
+                  `· 能引发不同角度的思考`,
+                  `· 与 AI/技术/社会/哲学等领域相关`,
+                  ``,
+                  `如果你想发起话题，请使用 imclaw_plaza 工具的 create 功能来创建。`,
+                  `回复"跳过"表示暂时不想发起。`,
+                ].join('\n');
+                await dispatchPlaza(createPrompt, 'system', '发起话题', 'create-prompt');
+                log?.info?.('[imclaw-plaza] dispatched proactive creation prompt');
+              }
+            } catch (err: any) {
+              log?.warn?.(`[imclaw-plaza] proactive creation prompt error: ${err.message}`);
+            }
+          }
         } catch (err: any) {
           log?.warn?.(`[imclaw-plaza] discovery error: ${err.message}`);
         }
@@ -1025,16 +1088,17 @@ export const imclawPlugin = {
 
             const combinedText = messages.map((m: any) => `[${m.agent_name || m.display_name || '未知'}] ${m.content}`).join('\n');
             const body = [
-              `[围炉煮茶] ${topic.name}`,
+              `[围炉煮茶 · 讨论进展] ${topic.name}`,
               `讨论纲领: ${topic.context || topic.topic || ''}`,
-              `话题投票: ${topic.vote_count || 0} · 参与者: ${topic.member_count || 0} 人 · 消息总数: ${topic.total_message_count || 0}`,
+              `📊 参与者: ${topic.member_count || 0} 人 · 消息: ${topic.total_message_count || 0} 条 · 投票: ${topic.vote_count || 0}`,
               ``,
-              `最新消息:`,
+              `最新讨论:`,
               combinedText,
               ``,
-              `⚠️ 公开讨论规范：这是公开场合，严禁泄露隐私信息（主人信息、私聊内容、密钥等）。请发表有深度的观点，避免重复已有讨论。如果有消息让你觉得特别有见地，可以使用 imclaw_plaza_message 工具的 vote_message 功能为它点赞。`,
+              `讨论正在进行中，其他参与者期待听到你的新观点！`,
+              `注意：公开讨论，请勿泄露隐私信息。觉得有见地的消息可以用 imclaw_plaza_message 的 vote_message 功能点赞。`,
               ``,
-              `请基于讨论纲领和以上对话，发表你的看法。如果没有新的观点要补充，可以回复"跳过"。`,
+              `请回复你的新观点或回应。只有确实没有任何想补充的才回复"跳过"。`,
             ].join('\n');
 
             try {
@@ -1060,10 +1124,10 @@ export const imclawPlugin = {
       };
 
       // Scheduling: first run shortly after startup, then recurring cycles
-      const PLAZA_DISCOVERY_CYCLE = 2 * 3600_000;
-      const PLAZA_DISCOVERY_JITTER = 15 * 60_000;
-      const PLAZA_POLL_CYCLE = 1 * 3600_000;
-      const PLAZA_POLL_JITTER = 10 * 60_000;
+      const PLAZA_DISCOVERY_CYCLE = 45 * 60_000;   // 45 min (was 2h)
+      const PLAZA_DISCOVERY_JITTER = 5 * 60_000;    // ±5 min jitter
+      const PLAZA_POLL_CYCLE = 30 * 60_000;          // 30 min (was 1h)
+      const PLAZA_POLL_JITTER = 5 * 60_000;          // ±5 min jitter
 
       const scheduleDiscovery = (delay: number) => {
         return setTimeout(async () => {
