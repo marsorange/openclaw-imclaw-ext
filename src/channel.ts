@@ -916,6 +916,16 @@ export const imclawPlugin = {
       // Agent autonomy: discovery dispatches topic info to the agent LLM,
       // which decides whether to join by replying. No auto-join.
 
+      // Helper: report plaza activity to the monitoring endpoint (best-effort, fire-and-forget)
+      const reportPlazaActivity = (event: string, detail?: string) => {
+        fetch(`${pc.humanApiUrl}/agent/plaza/activity`, {
+          method: 'POST',
+          headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}`, 'Content-Type': 'application/json' },
+          body: JSON.stringify({ event, detail: detail?.slice(0, 500) }),
+          signal: AbortSignal.timeout(5_000),
+        }).catch(() => {}); // fire-and-forget
+      };
+
       // Helper: dispatch a plaza context to the agent and collect its reply
       const dispatchPlaza = async (
         body: string,
@@ -968,6 +978,7 @@ export const imclawPlugin = {
 
       // Discovery: fetch available topics → present each to agent → join + post if agent replies
       const runDiscovery = async () => {
+        reportPlazaActivity('discovery_start');
         try {
           // Fetch what the agent already joined to skip those
           const myRes = await fetch(`${pc.humanApiUrl}/agent/plaza/my-topics`, {
@@ -1040,6 +1051,7 @@ export const imclawPlugin = {
               // Agent decided to skip
               if (!reply || /^(跳过|skip|pass|不感兴趣)/i.test(reply.trim())) {
                 log?.info?.(`[imclaw-plaza] agent skipped topic "${topic.name}"`);
+                reportPlazaActivity('topic_skipped', `${topic.name}: ${reply?.slice(0, 100) || '(no reply)'}`);
                 continue;
               }
 
@@ -1060,14 +1072,18 @@ export const imclawPlugin = {
                   signal: AbortSignal.timeout(10_000),
                 }).catch(() => {});
                 log?.info?.(`[imclaw-plaza] agent joined topic "${topic.name}" and posted first message`);
+                reportPlazaActivity('topic_joined', topic.name);
               }
             } catch (err: any) {
               log?.warn?.(`[imclaw-plaza] discovery dispatch error for "${topic.name}": ${err.message}`);
+              reportPlazaActivity('error', `discover dispatch: ${topic.name}: ${err.message}`);
             }
           }
           log?.info?.(`[imclaw-plaza] discovery done: ${candidates.length} candidates, ${joined} joined`);
+          reportPlazaActivity('discovery_done', `${candidates.length} candidates, ${joined} joined`);
 
           // ── Proactive creation: if few active topics and agent has credits, prompt to create ──
+          // Code-driven: capture agent's topic idea as text, then create via API directly.
           if (candidates.length <= 2 && joined === 0) {
             try {
               const creditsRes = await fetch(`${pc.humanApiUrl}/agent/plaza/my-credits`, {
@@ -1078,22 +1094,63 @@ export const imclawPlugin = {
               if (credits && credits.available > 0) {
                 const createPrompt = [
                   `[围炉煮茶 · 发起话题]`,
-                  `当前围炉煮茶的活跃话题较少，你有 ${credits.available} 个创建额度。`,
+                  `当前围炉煮茶的活跃话题较少（${candidates.length} 个），你有 ${credits.available} 个创建额度。`,
                   ``,
-                  `这是一个好机会！你可以发起一个你感兴趣的话题，邀请其他 Agent 一起讨论。`,
-                  `好的话题通常：`,
-                  `· 有明确的讨论焦点`,
-                  `· 能引发不同角度的思考`,
-                  `· 与 AI/技术/社会/哲学等领域相关`,
+                  `这是一个好机会！发起一个你感兴趣的话题，邀请其他 Agent 一起讨论吧。`,
+                  `好的话题通常有明确的讨论焦点，能引发不同角度的思考。`,
                   ``,
-                  `如果你想发起话题，请使用 imclaw_plaza 工具的 create 功能来创建。`,
-                  `回复"跳过"表示暂时不想发起。`,
+                  `请用以下格式回复你想发起的话题：`,
+                  `话题标题: <标题>`,
+                  `讨论纲领: <纲领描述>`,
+                  `标签: <标签1>, <标签2>`,
+                  ``,
+                  `只有确实暂时没有想法才回复"跳过"。`,
                 ].join('\n');
-                await dispatchPlaza(createPrompt, 'system', '发起话题', 'create-prompt');
-                log?.info?.('[imclaw-plaza] dispatched proactive creation prompt');
+                const reply = await dispatchPlaza(createPrompt, 'system', '发起话题', 'create-prompt');
+                reportPlazaActivity('creation_prompt', `credits: ${credits.available}`);
+                log?.info?.(`[imclaw-plaza] creation prompt reply: ${reply?.slice(0, 200) || '(empty)'}`);
+
+                if (reply && !/^(跳过|skip|pass)/i.test(reply.trim())) {
+                  // Parse title / context / tags from the agent's reply
+                  const titleMatch = reply.match(/话题标题[:：]\s*(.+)/);
+                  const tagsMatch = reply.match(/标签[:：]\s*(.+)/);
+                  // Context: everything between 讨论纲领: and 标签: (or end)
+                  const contextMatch = reply.match(/讨论纲领[:：]\s*([\s\S]+?)(?=\n标签[:：]|$)/);
+
+                  const title = titleMatch?.[1]?.trim().slice(0, 100)
+                    || reply.split('\n').find(l => l.trim().length > 0)?.trim().slice(0, 100)
+                    || '';
+                  const context = contextMatch?.[1]?.trim().slice(0, 2000)
+                    || reply.slice(0, 2000);
+                  const tagList = tagsMatch
+                    ? tagsMatch[1].split(/[,，、]/).map(t => t.trim()).filter(Boolean).slice(0, 5)
+                    : [];
+
+                  if (title) {
+                    const createBody: Record<string, unknown> = { title, context };
+                    if (tagList.length) createBody.tags = tagList;
+                    const createRes = await fetch(`${pc.humanApiUrl}/agent/plaza/topics`, {
+                      method: 'POST',
+                      headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}`, 'Content-Type': 'application/json' },
+                      body: JSON.stringify(createBody),
+                      signal: AbortSignal.timeout(10_000),
+                    }).catch(() => null);
+                    if (createRes?.ok) {
+                      const created = await createRes.json().catch(() => null) as any;
+                      log?.info?.(`[imclaw-plaza] agent created topic "${title}" (id: ${created?.id})`);
+                      reportPlazaActivity('topic_created', title);
+                    } else {
+                      const errBody = await createRes?.json().catch(() => ({})) as any;
+                      log?.warn?.(`[imclaw-plaza] topic creation failed: ${errBody?.error || createRes?.status}`);
+                      reportPlazaActivity('error', `create failed: ${errBody?.error || createRes?.status}`);
+                    }
+                  }
+                }
+              } else {
+                log?.info?.(`[imclaw-plaza] no creation credits available (contributions: ${credits?.contributions}, creations: ${credits?.creations})`);
               }
             } catch (err: any) {
-              log?.warn?.(`[imclaw-plaza] proactive creation prompt error: ${err.message}`);
+              log?.warn?.(`[imclaw-plaza] proactive creation error: ${err.message}`);
             }
           }
         } catch (err: any) {
@@ -1153,8 +1210,10 @@ export const imclawPlugin = {
             }
           }
           log?.info?.(`[imclaw-plaza] polled ${myTopics.length} topics`);
+          reportPlazaActivity('poll_done', `${myTopics.length} topics polled`);
         } catch (err: any) {
           log?.warn?.(`[imclaw-plaza] poll error: ${err.message}`);
+          reportPlazaActivity('error', `poll: ${err.message}`);
         }
       };
 
