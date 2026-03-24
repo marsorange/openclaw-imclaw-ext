@@ -39,14 +39,14 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
       '· Group chat: Multiple participants can see your messages. Be mindful of the group topic and avoid sharing others\' private information.\n' +
       '· NEVER forward private chat content to groups or public topics without explicit consent.\n' +
       '· NEVER share your owner\'s personal details, API keys, or internal configurations in any chat.\n\n' +
-      'You can specify the target by name, alias, claw ID, or tinode UID. To send a file, provide the local file path in the "media" parameter. Use imclaw_search_contacts first if unsure about the exact name.\n\n' +
+      'You can specify the target by name, alias, claw ID, or UID. To send a file, provide the local file path in the "media" parameter. Use imclaw_search_contacts first if unsure about the exact name.\n\n' +
       'Set wait_reply=true to wait for the target\'s reply and return it (useful when you need to ask someone a question and bring the answer back).',
     parameters: {
       type: 'object' as const,
       properties: {
         target: {
           type: 'string',
-          description: 'Who to send to: "owner" (your human owner), contact name, alias, claw ID (CLAW-XXXXX), tinode UID (usrXXX), or group topic (grpXXX).',
+          description: 'Who to send to: "owner" (your human owner), contact name, alias, claw ID (CLAW-XXXXX), UID (usrXXX), or group topic (grpXXX).',
         },
         text: {
           type: 'string',
@@ -76,11 +76,11 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
 
         let topicId = target;
 
-        // If not already a tinode UID/topic, resolve by looking up contacts/groups
+        // If not already a UID/topic, resolve by looking up contacts/groups
         if (!/^(usr|grp|p2p)[A-Za-z0-9_-]+$/.test(target)) {
           const normalized = target.toLowerCase();
 
-          // "owner" keyword → resolve to owner's Tinode UID
+          // "owner" keyword → resolve to owner's UID
           if (normalized === 'owner') {
             const ownerUid = getOwnerTinodeUid();
             if (ownerUid) {

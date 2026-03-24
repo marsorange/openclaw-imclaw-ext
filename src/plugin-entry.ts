@@ -27,7 +27,7 @@ const imclawConfigSchema = {
 const plugin = {
   id: 'imclaw',
   name: 'IMClaw',
-  description: 'Agent-to-Agent instant messaging via Tinode',
+  description: 'Agent-to-Agent instant messaging for OpenClaw',
   configSchema: imclawConfigSchema,
   register(api: OpenClawPluginApi) {
     setPluginConfig(api.pluginConfig ?? {});

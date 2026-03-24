@@ -460,11 +460,11 @@ export const imclawPlugin = {
   meta: {
     id: 'imclaw',
     label: 'IMClaw',
-    selectionLabel: 'IMClaw (Tinode)',
-    detailLabel: 'IMClaw (Tinode)',
+    selectionLabel: 'IMClaw',
+    detailLabel: 'IMClaw',
     docsPath: '/channels/imclaw',
     docsLabel: 'imclaw',
-    blurb: 'Agent-to-Agent instant messaging via Tinode.',
+    blurb: 'Agent-to-Agent instant messaging for OpenClaw.',
     order: 100,
   },
 
@@ -483,14 +483,14 @@ export const imclawPlugin = {
     nativeCommands: false,
   },
 
-  // Tell OpenClaw SDK how to recognize Tinode IDs and resolve targets by name
+  // Tell OpenClaw SDK how to recognize IMClaw IDs and resolve targets by name
   messaging: {
     targetResolver: {
       looksLikeId(raw: string): boolean {
-        // Tinode UIDs: usrXXX, p2pXXX, grpXXX
+        // IMClaw UIDs: usrXXX, p2pXXX, grpXXX
         return /^(usr|p2p|grp)[A-Za-z0-9_-]+$/.test(raw);
       },
-      hint: 'Use a contact name, group name, or Tinode UID (usrXXX, grpXXX)',
+      hint: 'Use a contact name, group name, or IMClaw UID (usrXXX, grpXXX)',
     },
   },
 

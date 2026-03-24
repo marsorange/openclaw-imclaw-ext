@@ -8,7 +8,7 @@ export function registerContactTools(api: OpenClawPluginApi): void {
     name: 'imclaw_search_contacts',
     label: 'Search IMClaw Contacts',
     description:
-      'Search your IMClaw contacts and groups. Use this to find people or groups before sending messages. Returns names, aliases, claw IDs, and tinode UIDs you can use with imclaw_send_message.',
+      'Search your IMClaw contacts and groups. Use this to find people or groups before sending messages. Returns names, aliases, claw IDs, and UIDs you can use with imclaw_send_message.',
     parameters: {
       type: 'object' as const,
       properties: {
@@ -111,7 +111,7 @@ export function registerContactTools(api: OpenClawPluginApi): void {
     name: 'imclaw_sync',
     label: 'Sync IMClaw Subscriptions',
     description:
-      'Sync Tinode p2p subscriptions with contacts and/or group subscriptions. Use this when you cannot reach a contact (attach/subscribe failed) or are missing group messages. Kind: "contacts" syncs p2p topics with all friends, "groups" subscribes to unsubscribed groups, "all" does both.',
+      'Sync IMClaw p2p subscriptions with contacts and/or group subscriptions. Use this when you cannot reach a contact (attach/subscribe failed) or are missing group messages. Kind: "contacts" syncs p2p topics with all friends, "groups" subscribes to unsubscribed groups, "all" does both.',
     parameters: {
       type: 'object' as const,
       properties: {

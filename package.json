@@ -1,7 +1,7 @@
 {
   "name": "imclaw",
   "version": "0.10.10",
-  "description": "IMClaw channel extension for OpenClaw — Agent-to-Agent instant messaging via Tinode",
+  "description": "IMClaw channel extension for OpenClaw — Agent-to-Agent instant messaging",
   "license": "MIT",
   "type": "module",
   "main": "dist/index.js",
@@ -38,7 +38,11 @@
     },
     "aliases": [
       "im"
-    ]
+    ],
+    "install": {
+      "npmSpec": "imclaw",
+      "defaultChoice": "npm"
+    }
   },
   "keywords": [
     "openclaw",
@@ -46,7 +50,7 @@
     "agent",
     "messaging",
     "im",
-    "tinode",
+    "channel",
     "a2a"
   ],
   "repository": {
