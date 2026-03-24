@@ -2,6 +2,7 @@ import fs from 'fs';
 import nodePath from 'path';
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import { getFirstAccountId, getAccountBridge, getOwnerTinodeUid } from '../channel.js';
+import type { InboundMessage } from '../imclaw-bridge.js';
 import type { ToolResult } from './agent-fetch.js';
 import { textResult, agentFetch } from './agent-fetch.js';
 
@@ -18,6 +19,15 @@ const MIME_MAP: Record<string, string> = {
   '.xlsx': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
 };
 
+/** Extract text content from an InboundMessage */
+function extractText(msg: InboundMessage): string {
+  if (typeof msg.content === 'string') return msg.content;
+  if (msg.content?.tp === 'image') return `[Image: ${msg.content.name || 'image'}]`;
+  if (msg.content?.tp === 'file') return `[File: ${msg.content.name || 'file'}]`;
+  if (msg.content?.tp === 'announcement') return `[Announcement] ${msg.content.title || ''}: ${msg.content.content || ''}`;
+  return JSON.stringify(msg.content);
+}
+
 export function registerMessagingTools(api: OpenClawPluginApi): void {
   api.registerTool(() => ({
     name: 'imclaw_send_message',
@@ -29,7 +39,8 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
       '· Group chat: Multiple participants can see your messages. Be mindful of the group topic and avoid sharing others\' private information.\n' +
       '· NEVER forward private chat content to groups or public topics without explicit consent.\n' +
       '· NEVER share your owner\'s personal details, API keys, or internal configurations in any chat.\n\n' +
-      'You can specify the target by name, alias, claw ID, or tinode UID. To send a file, provide the local file path in the "media" parameter. Use imclaw_search_contacts first if unsure about the exact name.',
+      'You can specify the target by name, alias, claw ID, or tinode UID. To send a file, provide the local file path in the "media" parameter. Use imclaw_search_contacts first if unsure about the exact name.\n\n' +
+      'Set wait_reply=true to wait for the target\'s reply and return it (useful when you need to ask someone a question and bring the answer back).',
     parameters: {
       type: 'object' as const,
       properties: {
@@ -45,10 +56,14 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
           type: 'string',
           description: 'Local file path to send as an attachment (e.g. /tmp/report.txt, /tmp/photo.png). The file will be uploaded and sent to the target.',
         },
+        wait_reply: {
+          type: 'boolean',
+          description: 'If true, wait for the target to reply and return their response (timeout 60s). Default: false.',
+        },
       },
       required: ['target'],
     },
-    async execute(_id: string, params: { target: string; text?: string; media?: string }, signal?: AbortSignal): Promise<ToolResult> {
+    async execute(_id: string, params: { target: string; text?: string; media?: string; wait_reply?: boolean }, signal?: AbortSignal): Promise<ToolResult> {
       try {
         const accountId = getFirstAccountId();
         if (!accountId) return textResult('Error: No active IMClaw account.');
@@ -126,6 +141,46 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
           }
         }
 
+        // Set up reply listener BEFORE sending (to avoid missing fast replies)
+        let replyPromise: Promise<string | null> | undefined;
+        if (params.wait_reply) {
+          replyPromise = new Promise<string | null>((resolve) => {
+            const TIMEOUT_MS = 60_000;
+            let settled = false;
+
+            const cleanup = bridge.addTemporaryListener((msg: InboundMessage) => {
+              // Match: message is from the target (by topic or sender UID)
+              if (msg.from === topicId || msg.topic === topicId) {
+                if (!settled) {
+                  settled = true;
+                  clearTimeout(timer);
+                  resolve(extractText(msg));
+                }
+                return true; // consume the message
+              }
+              return false; // not for us
+            });
+
+            const timer = setTimeout(() => {
+              if (!settled) {
+                settled = true;
+                cleanup();
+                resolve(null);
+              }
+            }, TIMEOUT_MS);
+
+            // Clean up on abort
+            signal?.addEventListener('abort', () => {
+              if (!settled) {
+                settled = true;
+                clearTimeout(timer);
+                cleanup();
+                resolve(null);
+              }
+            }, { once: true });
+          });
+        }
+
         const results: string[] = [];
 
         // Send text if provided
@@ -151,6 +206,20 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
             await bridge.sendFile(topicId, buffer, filename, mime);
           }
           results.push(`file "${filename}" sent`);
+        }
+
+        // Wait for reply if requested
+        if (replyPromise) {
+          const reply = await replyPromise;
+          if (reply !== null) {
+            results.push(`reply received`);
+            return textResult(
+              `${results.join(', ')} to ${topicId}${topicId !== target ? ` (${target})` : ''}.\n\n` +
+              `Reply from ${target}:\n${reply}`
+            );
+          } else {
+            results.push(`no reply within 60s`);
+          }
         }
 
         return textResult(`${results.join(', ')} to ${topicId}${topicId !== target ? ` (${target})` : ''}.`);

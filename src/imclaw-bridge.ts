@@ -35,6 +35,12 @@ export interface InboundMessage {
 export type MessageHandler = (message: InboundMessage) => void | Promise<void>;
 
 /**
+ * Temporary one-shot listener. Return `true` to consume the message
+ * (removes the listener and skips the normal messageHandler dispatch).
+ */
+export type TemporaryMessageListener = (message: InboundMessage) => boolean;
+
+/**
  * ImclawBridge - adapts Tinode messaging for OpenClaw agents.
  *
  * Inbound: Tinode {data} → InboundMessage → handler callback
@@ -52,6 +58,7 @@ export class ImclawBridge {
   private store: MessageStore | InMemoryStore;
   private config: ChannelConfig;
   private messageHandler: MessageHandler | null = null;
+  private temporaryListeners: TemporaryMessageListener[] = [];
 
   constructor(config: ChannelConfig) {
     this.config = config;
@@ -101,17 +108,32 @@ export class ImclawBridge {
         return;
       }
 
+      const inbound: InboundMessage = {
+        topic: msg.topic,
+        from: msg.from,
+        content: msg.content,
+        seqId: msg.seqId,
+        timestamp: msg.timestamp,
+        isGroup: msg.topic.startsWith('grp'),
+      };
+
+      // Check temporary listeners first (reverse order, one-shot)
+      for (let i = this.temporaryListeners.length - 1; i >= 0; i--) {
+        try {
+          if (this.temporaryListeners[i](inbound)) {
+            this.temporaryListeners.splice(i, 1);
+            console.log(`[imclaw-bridge] message intercepted by temporary listener`);
+            return; // consumed — skip normal handler
+          }
+        } catch (err) {
+          this.temporaryListeners.splice(i, 1);
+          console.error('[imclaw-bridge] temporary listener error:', err);
+        }
+      }
+
       console.log(`[imclaw-bridge] dispatching message to handler, hasHandler=${!!this.messageHandler}`);
-      // Dispatch to handler
+      // Dispatch to normal handler
       if (this.messageHandler) {
-        const inbound: InboundMessage = {
-          topic: msg.topic,
-          from: msg.from,
-          content: msg.content,
-          seqId: msg.seqId,
-          timestamp: msg.timestamp,
-          isGroup: msg.topic.startsWith('grp'),
-        };
         Promise.resolve(this.messageHandler(inbound)).catch((err) => {
           console.error('Message handler error:', err);
         });
@@ -129,6 +151,18 @@ export class ImclawBridge {
 
   onMessage(handler: MessageHandler): void {
     this.messageHandler = handler;
+  }
+
+  /**
+   * Register a one-shot temporary listener. Returns a cleanup function.
+   * If the listener returns `true`, the message is consumed and the listener is removed.
+   */
+  addTemporaryListener(listener: TemporaryMessageListener): () => void {
+    this.temporaryListeners.push(listener);
+    return () => {
+      const idx = this.temporaryListeners.indexOf(listener);
+      if (idx >= 0) this.temporaryListeners.splice(idx, 1);
+    };
   }
 
   async start(): Promise<void> {
