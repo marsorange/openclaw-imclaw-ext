@@ -908,6 +908,52 @@ export const imclawPlugin = {
             }
           }
         } catch { /* silent — dashboard presence is best-effort */ }
+
+        // Detect connect key changes in config (hot-reload for reconnect)
+        if (!refreshingCreds) {
+          try {
+            const rt = getPluginRuntime();
+            if (rt) {
+              const currentCfg = await rt.config.loadConfig() as Record<string, any>;
+              const currentAccount = currentCfg?.channels?.imclaw?.accounts?.[accountId];
+              const newConnectKey = currentAccount?.connectKey as string | undefined;
+              if (newConnectKey && newConnectKey !== ctx.configConnectKey) {
+                log?.info?.(`[imclaw] config connect key changed → hot-reloading...`);
+                refreshingCreds = true;
+                try {
+                  const resolvedAgentName = (currentAccount?.agentName as string) || undefined;
+                  const creds = await exchangeConnectKey(newConnectKey, ctx.humanApiUrl, resolvedAgentName);
+
+                  // Update cache (clean: only current key)
+                  saveCredsCache({ [newConnectKey]: creds } as Record<string, CachedCredential>);
+
+                  // Update auth & context
+                  ctx.heartbeatAuth = Buffer.from(`${creds.username}:${creds.password}`).toString('base64');
+                  ctx.configConnectKey = newConnectKey;
+
+                  // Reconnect bridge with new credentials
+                  try { await ctx.bridge.stop(); } catch { /* ignore */ }
+                  bridgeConfig.tinodeServerUrl = creds.serverUrl || bridgeConfig.tinodeServerUrl;
+                  bridgeConfig.tinodeUsername = creds.username;
+                  bridgeConfig.tinodePassword = creds.password;
+                  if (creds.apiKey) bridgeConfig.tinodeApiKey = creds.apiKey;
+                  if (creds.httpBaseUrl) bridgeConfig.httpBaseUrl = creds.httpBaseUrl;
+
+                  const newBridge = new ImclawBridge(bridgeConfig);
+                  registerMessageHandler(newBridge, accountId, log, mediaDir);
+                  await newBridge.start();
+                  ctx.bridge = newBridge;
+
+                  log?.info?.(`[imclaw] reconnected with new connect key for ${creds.username.substring(0, 6)}***`);
+                } catch (err: any) {
+                  log?.error?.(`[imclaw] connect key hot-reload failed: ${err.message}`);
+                } finally {
+                  refreshingCreds = false;
+                }
+              }
+            }
+          } catch { /* silent */ }
+        }
       };
       sendHeartbeat(); // immediate first beat
       ctx.heartbeatTimer = setInterval(sendHeartbeat, 60_000); // every 60s (TTL is 120s)
