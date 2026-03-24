@@ -865,13 +865,48 @@ export const imclawPlugin = {
 
       // Presence heartbeat — reads ctx.heartbeatAuth so reconnect updates take effect
       const heartbeatUrl = `${pc.humanApiUrl}/agent/heartbeat`;
+      let refreshingCreds = false;
       const sendHeartbeat = async () => {
         try {
-          await fetch(heartbeatUrl, {
+          const res = await fetch(heartbeatUrl, {
             method: 'POST',
             headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}` },
             signal: AbortSignal.timeout(10_000),
           });
+          // Credentials rotated — hot-refresh from cache
+          if (res.status === 401 && !refreshingCreds) {
+            refreshingCreds = true;
+            try {
+              const cache = loadCredsCache();
+              const entries = Object.values(cache);
+              if (entries.length === 0) return;
+              const cred = entries[entries.length - 1];
+              if (!cred.password) return;
+
+              // Extract current username and password from heartbeatAuth
+              const decoded = Buffer.from(ctx.heartbeatAuth, 'base64').toString('utf-8');
+              const colonIdx = decoded.indexOf(':');
+              const curUser = decoded.slice(0, colonIdx);
+              const curPass = decoded.slice(colonIdx + 1);
+              if (cred.password === curPass) return; // same password, nothing to refresh
+
+              log?.info?.('[imclaw] heartbeat 401 — refreshing credentials from cache...');
+              ctx.heartbeatAuth = Buffer.from(`${curUser}:${cred.password}`).toString('base64');
+
+              // Reconnect Tinode bridge with new password
+              try { await ctx.bridge.stop(); } catch { /* ignore */ }
+              bridgeConfig.tinodePassword = cred.password;
+              const newBridge = new ImclawBridge(bridgeConfig);
+              registerMessageHandler(newBridge, accountId, log, mediaDir);
+              await newBridge.start();
+              ctx.bridge = newBridge;
+              log?.info?.('[imclaw] credentials refreshed and bridge reconnected');
+            } catch (err: any) {
+              log?.error?.(`[imclaw] credential refresh failed: ${err.message}`);
+            } finally {
+              refreshingCreds = false;
+            }
+          }
         } catch { /* silent — dashboard presence is best-effort */ }
       };
       sendHeartbeat(); // immediate first beat
