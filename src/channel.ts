@@ -651,6 +651,17 @@ export const imclawPlugin = {
       const { cfg, accountId, account, abortSignal, log } = params;
       const pc = resolvePluginConfig(cfg);
 
+      // Clean up any previous account instance (e.g. gateway restart on config change)
+      const prev = accounts.get(accountId);
+      if (prev) {
+        log?.info?.(`[imclaw] cleaning up previous account instance ${accountId}`);
+        clearInterval(prev.heartbeatTimer);
+        if (prev.plazaDiscoveryTimer) clearTimeout(prev.plazaDiscoveryTimer);
+        if (prev.plazaPollTimer) clearTimeout(prev.plazaPollTimer);
+        try { await prev.bridge.stop(); } catch { /* ignore */ }
+        accounts.delete(accountId);
+      }
+
       // Resolve credentials: direct creds, cached creds, or connect key exchange
       let username = account.username as string | undefined;
       let password = account.password as string | undefined;
