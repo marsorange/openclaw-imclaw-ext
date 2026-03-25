@@ -8,13 +8,14 @@ export function registerContactTools(api: OpenClawPluginApi): void {
     name: 'imclaw_search_contacts',
     label: 'Search IMClaw Contacts',
     description:
-      'Search your IMClaw contacts and groups. Use this to find people or groups before sending messages. Returns names, aliases, claw IDs, and UIDs you can use with imclaw_send_message.',
+      'Search your IMClaw contacts and groups. Supports fuzzy matching by human name, agent name, alias, phone, claw ID, @customId, or tags. ' +
+      'Use this to find people or groups before sending messages. Returns names, aliases, claw IDs, and UIDs you can use with imclaw_send_message.',
     parameters: {
       type: 'object' as const,
       properties: {
         query: {
           type: 'string',
-          description: 'Filter by name, alias, or claw ID. Leave empty to list all.',
+          description: 'Search keyword — matches human name, agent name, alias, phone, claw ID, @customId, or tags. Leave empty to list all.',
         },
         kind: {
           type: 'string',
@@ -26,21 +27,26 @@ export function registerContactTools(api: OpenClawPluginApi): void {
     async execute(_id: string, params: { query?: string; kind?: string }, signal?: AbortSignal): Promise<ToolResult> {
       try {
         const kind = params.kind === 'groups' ? 'groups' : 'contacts';
-        const { ok, data } = await agentFetch(`/agent/${kind}`, { signal });
+        const q = params.query?.trim();
+
+        // For contacts with a query, use server-side fuzzy search
+        let url = `/agent/${kind}`;
+        if (kind === 'contacts' && q) {
+          url = `/agent/contacts?q=${encodeURIComponent(q)}`;
+        }
+
+        const { ok, data } = await agentFetch(url, { signal });
         if (!ok) return textResult(`Error: ${data.error || 'API error'}`);
 
         let items = data as any[];
-        const q = params.query?.trim().toLowerCase();
-        if (q) {
-          items = items.filter((item: any) => {
-            if (kind === 'groups') {
-              return (item.name || '').toLowerCase().includes(q)
-                || (item.topic || '').toLowerCase().includes(q);
-            }
-            return [item.contact_agent_name, item.alias, item.contact_claw_name,
-              item.contact_display_name, item.contact_claw_id,
-            ].some(f => f && f.toLowerCase().includes(q));
-          });
+
+        // Groups still use client-side filtering (no server search endpoint)
+        if (kind === 'groups' && q) {
+          const ql = q.toLowerCase();
+          items = items.filter((item: any) =>
+            (item.name || '').toLowerCase().includes(ql)
+            || (item.topic || '').toLowerCase().includes(ql)
+          );
         }
 
         if (items.length === 0) {
@@ -50,16 +56,24 @@ export function registerContactTools(api: OpenClawPluginApi): void {
         let summary: string;
         if (kind === 'groups') {
           summary = items.map((g: any) =>
-            `- ${g.name}${g.tinode_topic ? ` (topic: ${g.tinode_topic})` : ''} [${g.status || 'active'}]`
+            `- ${g.name}${g.tinode_topic ? ` (topic: ${g.tinode_topic})` : ''} [${g.status || 'active'}]` +
+            `\n  groupId: ${g.id}`
           ).join('\n');
         } else {
           summary = items.map((c: any) => {
-            const name = c.contact_agent_name || c.contact_claw_name || c.contact_display_name || c.alias || 'unknown';
-            const alias = c.alias && c.alias !== name ? ` (alias: ${c.alias})` : '';
-            const clawId = c.contact_claw_id ? ` [${c.contact_claw_id}]` : '';
+            const agentName = c.contact_agent_name || c.contact_claw_name || '';
+            const humanName = c.contact_display_name || '';
+            const alias = c.alias || '';
+            // Build a clear display: "AgentName (owner: HumanName)"
+            let display = agentName || humanName || alias || 'unknown';
+            if (humanName && humanName !== display) display += ` (owner: ${humanName})`;
+            if (alias && alias !== agentName && alias !== humanName) display += ` [alias: ${alias}]`;
+            const clawId = c.contact_claw_id ? ` ${c.contact_claw_id}` : '';
+            const customId = c.contact_custom_id ? ` @${c.contact_custom_id}` : '';
+            const tags = c.tags ? ` tags: ${c.tags}` : '';
             const uid = c.contact_tinode_uid ? ` uid: ${c.contact_tinode_uid}` : '';
             const userId = c.contact_user_id ? ` userId: ${c.contact_user_id}` : '';
-            return `- ${name}${alias}${clawId}${uid}${userId}`;
+            return `- ${display}${clawId}${customId}${uid}${userId}${tags}`;
           }).join('\n');
         }
         return textResult(`Found ${items.length} ${kind}:\n${summary}`);
@@ -74,13 +88,13 @@ export function registerContactTools(api: OpenClawPluginApi): void {
     name: 'imclaw_search_users',
     label: 'Search IMClaw Users',
     description:
-      'Search for IMClaw users by phone number, @customId, or CLAW-ID. Use this to discover people before sending a friend request. Returns user profiles with claw ID, name, bio, tags, and social status.',
+      'Search for IMClaw users by name, phone number, @customId, or CLAW-ID. Use this to discover people before sending a friend request. Returns user profiles with claw ID, name, bio, tags, and social status.',
     parameters: {
       type: 'object' as const,
       properties: {
         query: {
           type: 'string',
-          description: 'Search by phone number, @customId (e.g. "@alice"), or CLAW-ID (e.g. "CLAW-XXXXX").',
+          description: 'Search by human name, agent name, phone number, @customId (e.g. "@alice"), or CLAW-ID (e.g. "CLAW-XXXXX").',
         },
       },
       required: ['query'],
