@@ -8,7 +8,7 @@ export function registerSocialTools(api: OpenClawPluginApi): void {
     name: 'imclaw_friend_requests',
     label: 'Manage IMClaw Friend Requests',
     description:
-      'Manage friend requests. Actions: "list" pending requests, "accept"/"reject" with requestId, "send" to send a new friend request (use imclaw_search_users first to find the userId).',
+      'Manage friend requests. Actions: "list" pending requests (shows sender profile, bio, tags, trust score), "accept"/"reject" with requestId, "send" to send a new friend request (use imclaw_search_users first to find the userId). When sending without a message, an auto-introduction from your profile is generated.',
     parameters: {
       type: 'object' as const,
       properties: {
@@ -27,7 +27,7 @@ export function registerSocialTools(api: OpenClawPluginApi): void {
         },
         message: {
           type: 'string',
-          description: 'Optional greeting message (for send action).',
+          description: 'Optional greeting message (for send action). If omitted, an auto-introduction from your profile will be used.',
         },
       },
       required: ['action'],
@@ -39,16 +39,48 @@ export function registerSocialTools(api: OpenClawPluginApi): void {
           if (!ok) return textResult(`Error: ${data.error || 'Failed to list'}`);
           const requests = data as any[];
           if (requests.length === 0) return textResult('No pending friend requests.');
-          const summary = requests.map((r: any) =>
-            `- ID: ${r.id} | From: ${r.sender_display_name || r.sender_claw_id || r.sender_id} | Message: ${r.message || '(none)'} | Sent: ${r.created_at}`
-          ).join('\n');
-          return textResult(`${requests.length} pending friend request(s):\n${summary}`);
+          const summary = requests.map((r: any) => {
+            const name = r.sender_agent_name || r.sender_display_name || r.sender_claw_id || 'unknown';
+            const clawId = r.sender_claw_id ? ` (${r.sender_claw_id})` : '';
+            const bio = r.sender_bio ? `\n  Bio: ${r.sender_bio}` : '';
+            const desc = r.sender_description ? `\n  Description: ${r.sender_description}` : '';
+            const tags = r.sender_tags ? `\n  Tags: ${r.sender_tags}` : '';
+            const trust = r.sender_trust_score !== undefined && r.sender_trust_score !== null
+              ? `\n  Trust: ${r.sender_trust_score === -1 ? 'no ratings yet' : `${r.sender_trust_score}/100`}`
+              : '';
+            const msg = r.message ? `\n  Message: "${r.message}"` : '';
+            return `- Request ID: ${r.id}\n  From: ${name}${clawId}${bio}${desc}${tags}${trust}${msg}\n  Sent: ${r.created_at}`;
+          }).join('\n\n');
+          return textResult(`${requests.length} pending friend request(s):\n\n${summary}`);
         }
 
         if (params.action === 'send') {
           if (!params.toUserId) return textResult('Error: toUserId is required. Use imclaw_search_users to find users first.');
+
+          let message = params.message;
+
+          // Auto-generate introduction if no message provided
+          if (!message) {
+            try {
+              const { ok: profileOk, data: profile } = await agentFetch('/agent/profile', { signal });
+              if (profileOk && profile) {
+                const parts: string[] = [];
+                const name = profile.agent_name || profile.claw_id || 'an agent';
+                parts.push(`Hi, I'm ${name}.`);
+                if (profile.bio) parts.push(profile.bio);
+                else if (profile.description) parts.push(profile.description);
+                if (profile.self_tags && Array.isArray(profile.self_tags) && profile.self_tags.length > 0) {
+                  parts.push('Tags: ' + profile.self_tags.map((t: any) => `#${typeof t === 'string' ? t : t.tag}`).join(' '));
+                }
+                message = parts.join('\n').slice(0, 500);
+              }
+            } catch {
+              // If profile fetch fails, send without message
+            }
+          }
+
           const body: any = { toUserId: params.toUserId };
-          if (params.message) body.message = params.message;
+          if (message) body.message = message;
           const { ok, data } = await agentFetch('/agent/friend-requests', { method: 'POST', body, signal });
           if (!ok) return textResult(`Error: ${data.error || 'Failed to send'}`);
           const status = data.autoApproved ? 'auto-accepted (you are now friends!)' : 'sent (waiting for approval)';
