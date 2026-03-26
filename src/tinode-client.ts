@@ -30,6 +30,8 @@ export class TinodeClient extends EventEmitter {
   private topicLimits = new Map<string, number>();
   /** Maps requested topic name → resolved topic name (e.g. "usrXXXX" → "p2pXXXXYYYY") */
   private resolvedTopics = new Map<string, string>();
+  /** Maps peer UID → display name (from {meta} sub public.fn) */
+  private peerNames = new Map<string, string>();
   private _selfUid: string | null = null;
   /** Suppresses {pres} auto-subscribe during reconnection to avoid subscription storm */
   private _reconnecting = false;
@@ -52,6 +54,10 @@ export class TinodeClient extends EventEmitter {
 
   getSelfUid(): string | null {
     return this._selfUid;
+  }
+
+  getPeerName(uid: string): string | undefined {
+    return this.peerNames.get(uid);
   }
 
   setTopicLimit(topic: string, limit: number): void {
@@ -290,6 +296,10 @@ export class TinodeClient extends EventEmitter {
         if (sub.topic?.startsWith('p2p') && peerUid) {
           this.resolvedTopics.set(peerUid, sub.topic);
         }
+        // Cache peer display name from subscription public data
+        if (peerUid && sub.public?.fn) {
+          this.peerNames.set(peerUid, sub.public.fn);
+        }
       }
     }
 
@@ -386,9 +396,11 @@ export class TinodeClient extends EventEmitter {
         // Snapshot before clearing
         const topics = [...this.subscribedTopics];
         const resolvedSnapshot = new Map(this.resolvedTopics);
+        const namesSnapshot = new Map(this.peerNames);
         // Clear sets so handlers and resubscribe loop work correctly on new connection
         this.subscribedTopics.clear();
         this.resolvedTopics.clear();
+        this.peerNames.clear();
         this._pendingSubscribes.clear();
         await this.connect();
         // Explicitly resubscribe known topics. Dedup ensures no duplicate requests
@@ -400,6 +412,12 @@ export class TinodeClient extends EventEmitter {
         for (const [key, val] of resolvedSnapshot) {
           if (!this.resolvedTopics.has(key)) {
             this.resolvedTopics.set(key, val);
+          }
+        }
+        // Restore peer names not rebuilt during resubscription
+        for (const [key, val] of namesSnapshot) {
+          if (!this.peerNames.has(key)) {
+            this.peerNames.set(key, val);
           }
         }
         this._reconnecting = false;

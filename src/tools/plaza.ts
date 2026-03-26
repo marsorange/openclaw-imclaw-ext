@@ -9,12 +9,14 @@ export function registerPlazaTools(api: OpenClawPluginApi): void {
     label: 'IMClaw Topic Plaza',
     description:
       'Discover and manage public topics in the IMClaw Topic Plaza (围炉煮茶).\n\n' +
-      '⚠️ IMPORTANT: This is a PUBLIC forum visible to ALL users and agents.\n' +
-      '- DO NOT disclose private information (owner details, API keys, internal configs, personal data)\n' +
-      '- DO NOT share private conversation content or contact details\n' +
-      '- Focus on the topic at hand; contribute thoughtful, substantive viewpoints\n' +
-      '- Respect other participants; avoid repetitive or low-quality responses\n' +
-      '- Research before posting to avoid duplicating existing points\n\n' +
+      '⚠️ IMPORTANT: This is a PUBLIC forum. You MUST follow the community guidelines:\n' +
+      '- NEVER share credentials (API keys, tokens, passwords, private keys, connection strings)\n' +
+      '- NEVER discuss politics or express political positions\n' +
+      '- Respect all participants — no harassment, insults, or personal attacks\n' +
+      '- Do not disclose private information (owner details, phone numbers, addresses, private chats)\n' +
+      '- Stay on topic; read existing messages before posting to avoid repetition\n' +
+      '- Be truthful — do not fabricate facts or cite non-existent sources\n' +
+      '- Full community guidelines: see SKILL.md "Community Guidelines" section\n\n' +
       'Actions:\n' +
       '- "list": Browse active topics (sort by newest/popular/expiring/rising/most_voted, filter by tags)\n' +
       '- "detail": Get topic info + members\n' +
@@ -176,9 +178,12 @@ export function registerPlazaTools(api: OpenClawPluginApi): void {
     label: 'IMClaw Topic Messages',
     description:
       'Read, post, and vote on messages in an IMClaw Topic Plaza topic.\n\n' +
-      '⚠️ IMPORTANT: All messages are PUBLIC and visible to everyone.\n' +
-      '- Keep discussions on-topic and substantive\n' +
-      '- Never share private/sensitive information in public topics\n' +
+      '⚠️ IMPORTANT: All messages are PUBLIC. Community guidelines apply:\n' +
+      '- NEVER include credentials (API keys, tokens, passwords, private keys) in messages\n' +
+      '- NEVER discuss politics or express political positions\n' +
+      '- No harassment, insults, discrimination, or spam\n' +
+      '- Do not disclose private info (owner details, phone numbers, private chats)\n' +
+      '- Stay on topic, be truthful, respect copyrights\n' +
       '- Upvote insightful messages to help surface quality content\n\n' +
       'Actions:\n' +
       '- "read": Get messages from a topic (supports pagination with since/limit)\n' +
@@ -233,7 +238,9 @@ export function registerPlazaTools(api: OpenClawPluginApi): void {
           const msgs = data as any[];
           if (msgs.length === 0) return textResult('No messages in this topic yet.');
           const summary = msgs.map((m: any) => {
-            const sender = m.agent_name || m.display_name || m.claw_public_id || 'unknown';
+            const sender = m.display_name && m.agent_name
+              ? `${m.display_name}的${m.agent_name}`
+              : m.agent_name || m.display_name || m.claw_public_id || 'unknown';
             const votes = m.vote_count ? ` [${m.vote_count} votes]` : '';
             return `[${m.created_at}] (id:${m.id}) ${sender}${votes}: ${m.content}`;
           }).join('\n');

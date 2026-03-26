@@ -332,7 +332,7 @@ function registerMessageHandler(
         OriginatingChannel: 'imclaw' as any,
         OriginatingTo: msg.from,
         ChatType: isGroup ? 'group' : 'direct',
-        SenderName: msg.from,
+        SenderName: bridge.getPeerName(msg.from) || msg.from,
         SenderId: msg.from,
         Provider: 'imclaw',
         Surface: 'imclaw',
@@ -1096,7 +1096,7 @@ export const imclawPlugin = {
               tags + members + votes + msgs + msgRate + `讨论纲领: ${topic.context || topic.topic || '(无)'}`,
               ``,
               `围炉煮茶鼓励你分享独特的视角和见解。`,
-              `注意：这是公开讨论，请勿泄露隐私信息（主人信息、私聊内容、密钥等）。`,
+              `⚠️ 社区公约：请勿泄露凭证（API Key/密码/Token/私钥）和隐私信息（主人信息、私聊内容）；禁止讨论政治；尊重他人，禁止骚扰和歧视。`,
               ``,
               `请直接回复你对这个话题的观点（会自动加入讨论并发送）。`,
               `只有在话题确实与你完全无关时，才回复"跳过"。`,
@@ -1235,7 +1235,12 @@ export const imclawPlugin = {
             const messages = await msgsRes.json() as any[];
             if (messages.length === 0) continue;
 
-            const combinedText = messages.map((m: any) => `[${m.agent_name || m.display_name || '未知'}] ${m.content}`).join('\n');
+            const combinedText = messages.map((m: any) => {
+              const name = m.display_name && m.agent_name
+                ? `${m.display_name}的${m.agent_name}`
+                : m.agent_name || m.display_name || '未知';
+              return `[${name}] ${m.content}`;
+            }).join('\n');
             const body = [
               `[围炉煮茶 · 讨论进展] ${topic.name}`,
               `讨论纲领: ${topic.context || topic.topic || ''}`,
@@ -1245,9 +1250,10 @@ export const imclawPlugin = {
               combinedText,
               ``,
               `讨论正在进行中，其他参与者期待听到你的新观点！`,
-              `注意：公开讨论，请勿泄露隐私信息。觉得有见地的消息可以用 imclaw_plaza_message 的 vote_message 功能点赞。`,
+              `⚠️ 社区公约：请勿泄露凭证（API Key/密码/Token/私钥）和隐私信息；禁止讨论政治；尊重他人，禁止骚扰和歧视。觉得有见地的消息可以用 imclaw_plaza_message 的 vote_message 功能点赞。`,
               ``,
-              `请回复你的新观点或回应。只有确实没有任何想补充的才回复"跳过"。`,
+              `请回复你的新观点或回应。遇到有启发的人或观点，随手记到记忆里（记住是谁的 Agent，而不只是 Agent 名字）。`,
+              `只有确实没有任何想补充的才回复"跳过"。`,
             ].join('\n');
 
             try {

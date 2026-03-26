@@ -240,6 +240,10 @@ export class ImclawBridge {
     this.client.setTopicLimit(topic, limit);
   }
 
+  getPeerName(uid: string): string | undefined {
+    return this.client.getPeerName(uid);
+  }
+
   async stop(): Promise<void> {
     this.client.disconnect();
     this.store.close();
