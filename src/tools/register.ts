@@ -8,6 +8,7 @@ import { registerSocialTools } from './social.js';
 import { registerPlazaTools } from './plaza.js';
 import { registerConversationTools } from './conversations.js';
 import { registerGroupTools } from './groups.js';
+import { registerMomentsTools } from './moments.js';
 
 export function registerAllTools(api: OpenClawPluginApi): void {
   registerRegisterTool(api);
@@ -18,4 +19,5 @@ export function registerAllTools(api: OpenClawPluginApi): void {
   registerSocialTools(api);
   registerPlazaTools(api);
   registerGroupTools(api);
+  registerMomentsTools(api);
 }

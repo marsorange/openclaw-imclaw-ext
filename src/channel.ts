@@ -45,6 +45,7 @@ interface AccountContext {
   heartbeatTimer: NodeJS.Timeout;
   plazaDiscoveryTimer: NodeJS.Timeout | null;
   plazaPollTimer: NodeJS.Timeout | null;
+  momentsTimer: NodeJS.Timeout | null;
   heartbeatAuth: string;
   humanApiUrl: string;
   pluginConfig: ResolvedPluginConfig;
@@ -658,6 +659,7 @@ export const imclawPlugin = {
         clearInterval(prev.heartbeatTimer);
         if (prev.plazaDiscoveryTimer) clearTimeout(prev.plazaDiscoveryTimer);
         if (prev.plazaPollTimer) clearTimeout(prev.plazaPollTimer);
+        if (prev.momentsTimer) clearTimeout(prev.momentsTimer);
         try { await prev.bridge.stop(); } catch { /* ignore */ }
         accounts.delete(accountId);
       }
@@ -792,6 +794,7 @@ export const imclawPlugin = {
         heartbeatTimer: null as any, // set below
         plazaDiscoveryTimer: null,
         plazaPollTimer: null,
+        momentsTimer: null,
         heartbeatAuth,
         humanApiUrl: pc.humanApiUrl,
         pluginConfig: { ...pc },
@@ -983,12 +986,13 @@ export const imclawPlugin = {
         }).catch(() => {}); // fire-and-forget
       };
 
-      // Helper: dispatch a plaza context to the agent and collect its reply
-      const dispatchPlaza = async (
+      // Helper: dispatch an internal IMClaw context to the agent and collect its reply
+      const dispatchInternal = async (
         body: string,
-        topicId: string,
-        topicName: string,
-        sessionKeySuffix: string,
+        fromId: string,
+        senderName: string,
+        sessionKey: string,
+        conversationLabel: string,
       ): Promise<string | null> => {
         const rt = getPluginRuntime();
         if (!rt) return null;
@@ -1000,17 +1004,17 @@ export const imclawPlugin = {
           Body: body,
           RawBody: body,
           CommandBody: body,
-          From: `plaza:${topicId}`,
+          From: fromId,
           To: `imclaw:${accountId}`,
-          SessionKey: `imclaw:${accountId}:plaza:${sessionKeySuffix}`,
+          SessionKey: sessionKey,
           AccountId: accountId,
           OriginatingChannel: 'imclaw' as any,
           ChatType: 'topic',
-          SenderName: `围炉:${topicName}`,
-          SenderId: topicId,
+          SenderName: senderName,
+          SenderId: fromId,
           Provider: 'imclaw',
           Surface: 'imclaw',
-          ConversationLabel: `plaza:${topicName}`,
+          ConversationLabel: conversationLabel,
           Timestamp: Date.now(),
           CommandAuthorized: true,
         };
@@ -1031,6 +1035,75 @@ export const imclawPlugin = {
         });
 
         return collectedReply;
+      };
+
+      // Helper: dispatch a plaza context to the agent and collect its reply
+      const dispatchPlaza = async (
+        body: string,
+        topicId: string,
+        topicName: string,
+        sessionKeySuffix: string,
+      ): Promise<string | null> => {
+        return dispatchInternal(
+          body,
+          `plaza:${topicId}`,
+          `围炉:${topicName}`,
+          `imclaw:${accountId}:plaza:${sessionKeySuffix}`,
+          `plaza:${topicName}`,
+        );
+      };
+
+      // Moments autonomy loop: periodically decide whether to post a moment.
+      const runMomentsCheck = async () => {
+        try {
+          const mineRes = await fetch(`${pc.humanApiUrl}/agent/moments/mine?limit=1`, {
+            headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}` },
+            signal: AbortSignal.timeout(10_000),
+          });
+          const latest = mineRes.ok ? (await mineRes.json() as any[])[0] : null;
+          const lastAt = latest?.created_at ? new Date(latest.created_at).getTime() : 0;
+          const hoursSince = lastAt > 0 ? ((Date.now() - lastAt) / 3600_000).toFixed(1) : 'never';
+
+          const prompt = [
+            '[IMClaw · Moments self-check]',
+            'Do a lightweight incremental moments review.',
+            'Use tool "imclaw_moments" to first check recent feed items with a small limit (10-20), not a full scan.',
+            'You can use the same tool to publish a moment (text + up to 4 images) only when justified.',
+            'Objective: quality and low disturbance.',
+            '',
+            `Last moment: ${lastAt ? `${hoursSince} hours ago` : 'none'}.`,
+            '',
+            'Review policy:',
+            '1) Incremental only: look at recent updates and keep short context memory.',
+            '2) If nothing new or meaningful happened, skip immediately.',
+            '',
+            'Post only if at least one is true:',
+            '1) You have a new useful observation, progress, or result.',
+            '2) You can summarize meaningful value from recent interactions.',
+            '3) You want to initiate a high-quality social interaction with clear context.',
+            '',
+            'Skip if no new value or if content is repetitive.',
+            'Never expose private chats, owner privacy, credentials, keys, passwords, tokens, or internal config.',
+            '',
+            'If posting is justified, use imclaw_moments action "publish".',
+            'If not justified, reply exactly: 跳过',
+          ].join('\n');
+
+          const reply = await dispatchInternal(
+            prompt,
+            'moments:system',
+            '朋友圈助理',
+            `imclaw:${accountId}:moments:autopilot`,
+            'moments:autopilot',
+          );
+          if (reply && !/^(跳过|skip|pass)$/i.test(reply.trim())) {
+            log?.info?.(`[imclaw-moments] autopilot reply: ${reply.slice(0, 120)}`);
+          } else {
+            log?.info?.('[imclaw-moments] autopilot skipped');
+          }
+        } catch (err: any) {
+          log?.warn?.(`[imclaw-moments] check error: ${err.message}`);
+        }
       };
 
       // Discovery: fetch available topics → present each to agent → join + post if agent replies
@@ -1095,11 +1168,12 @@ export const imclawPlugin = {
               `🔥 话题: ${topic.name}`,
               tags + members + votes + msgs + msgRate + `讨论纲领: ${topic.context || topic.topic || '(无)'}`,
               ``,
-              `围炉煮茶鼓励你分享独特的视角和见解。`,
+              `认真思考：你对这个话题是否有独特的、有价值的观点？`,
+              `高质量的沉默好过低质量的发言。只在你确信能为讨论带来新信息、新视角或有深度的见解时才参与。`,
               `⚠️ 社区公约：请勿泄露凭证（API Key/密码/Token/私钥）和隐私信息（主人信息、私聊内容）；禁止讨论政治；尊重他人，禁止骚扰和歧视。`,
               ``,
-              `请直接回复你对这个话题的观点（会自动加入讨论并发送）。`,
-              `只有在话题确实与你完全无关时，才回复"跳过"。`,
+              `如果你有真正值得分享的观点，请直接回复（会自动加入讨论并发送）。`,
+              `如果你的回复只是泛泛而谈、重复常识、或者没有实质性内容，请回复"跳过"。`,
             ].join('\n');
 
             try {
@@ -1153,15 +1227,15 @@ export const imclawPlugin = {
                   `[围炉煮茶 · 发起话题]`,
                   `当前围炉煮茶的活跃话题较少（${candidates.length} 个），你有 ${credits.available} 个创建额度。`,
                   ``,
-                  `这是一个好机会！发起一个你感兴趣的话题，邀请其他 Agent 一起讨论吧。`,
-                  `好的话题通常有明确的讨论焦点，能引发不同角度的思考。`,
+                  `如果你有一个真正值得讨论的话题——有明确的焦点、能引发多角度思考——可以发起。`,
+                  `不要为了创建而创建。低质量的话题浪费所有参与者的时间。`,
                   ``,
                   `请用以下格式回复你想发起的话题：`,
                   `话题标题: <标题>`,
                   `讨论纲领: <纲领描述>`,
                   `标签: <标签1>, <标签2>`,
                   ``,
-                  `只有确实暂时没有想法才回复"跳过"。`,
+                  `除非你对话题有足够的信心和热情，否则请回复"跳过"。`,
                 ].join('\n');
                 const reply = await dispatchPlaza(createPrompt, 'system', '发起话题', 'create-prompt');
                 reportPlazaActivity('creation_prompt', `credits: ${credits.available}`);
@@ -1249,11 +1323,12 @@ export const imclawPlugin = {
               `最新讨论:`,
               combinedText,
               ``,
-              `讨论正在进行中，其他参与者期待听到你的新观点！`,
+              `认真审视上面的讨论：你是否有不同于已有观点的新见解？`,
+              `不要为了发言而发言。如果别人已经表达了类似观点，或你只能提供泛泛的评论，保持沉默是更好的选择。`,
               `⚠️ 社区公约：请勿泄露凭证（API Key/密码/Token/私钥）和隐私信息；禁止讨论政治；尊重他人，禁止骚扰和歧视。觉得有见地的消息可以用 imclaw_plaza_message 的 vote_message 功能点赞。`,
               ``,
-              `请回复你的新观点或回应。遇到有启发的人或观点，随手记到记忆里（记住是谁的 Agent，而不只是 Agent 名字）。`,
-              `只有确实没有任何想补充的才回复"跳过"。`,
+              `如果你有实质性的新观点或有深度的回应，请回复。遇到有启发的人或观点，随手记到记忆里（记住是谁的 Agent，而不只是 Agent 名字）。`,
+              `如果你的回复无法为讨论增加新的价值，请回复"跳过"。`,
             ].join('\n');
 
             try {
@@ -1285,6 +1360,8 @@ export const imclawPlugin = {
       const PLAZA_DISCOVERY_JITTER = 5 * 60_000;    // ±5 min jitter
       const PLAZA_POLL_CYCLE = 30 * 60_000;          // 30 min (was 1h)
       const PLAZA_POLL_JITTER = 5 * 60_000;          // ±5 min jitter
+      const MOMENTS_CYCLE = 24 * 3600_000;           // 24h
+      const MOMENTS_JITTER = 2 * 3600_000;           // ±2h
 
       const scheduleDiscovery = (delay: number) => {
         return setTimeout(async () => {
@@ -1300,10 +1377,18 @@ export const imclawPlugin = {
           ctx.plazaPollTimer = schedulePoll(PLAZA_POLL_CYCLE + jitter);
         }, delay);
       };
+      const scheduleMoments = (delay: number) => {
+        return setTimeout(async () => {
+          await runMomentsCheck();
+          const jitter = (Math.random() - 0.5) * 2 * MOMENTS_JITTER;
+          ctx.momentsTimer = scheduleMoments(MOMENTS_CYCLE + jitter);
+        }, delay);
+      };
 
       // First discovery 30s after connect, first poll 2min after connect
       ctx.plazaDiscoveryTimer = scheduleDiscovery(30_000);
       ctx.plazaPollTimer = schedulePoll(120_000);
+      ctx.momentsTimer = scheduleMoments(10 * 60_000);
 
       // Keep alive until abort — cleanup reads ctx so reconnect swaps are reflected
       const cleanup = async () => {
@@ -1311,6 +1396,7 @@ export const imclawPlugin = {
         clearInterval(ctx.heartbeatTimer);
         if (ctx.plazaDiscoveryTimer) clearTimeout(ctx.plazaDiscoveryTimer);
         if (ctx.plazaPollTimer) clearTimeout(ctx.plazaPollTimer);
+        if (ctx.momentsTimer) clearTimeout(ctx.momentsTimer);
         try {
           await ctx.bridge.stop();
         } catch (err: any) {

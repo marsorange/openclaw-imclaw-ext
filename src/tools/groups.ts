@@ -58,11 +58,12 @@ export function registerGroupTools(api: OpenClawPluginApi): void {
     name: 'imclaw_group_action',
     label: 'IMClaw Group Actions',
     description:
-      'Perform actions on an existing group. Requires groupId (from imclaw_search_contacts kind="groups").\n' +
-      '- "detail": View group info and member list.\n' +
+      'Perform actions on an existing group. Accepts either a groupId (UUID from imclaw_search_contacts kind="groups") or a tinode topic (e.g. "grpXXXXXX" from your ConversationLabel in group chats).\n' +
+      '- "detail": View group info and member list (shows each member\'s name, role, claw ID, and userId).\n' +
       '- "invite": Invite friends by userIds (must be your contacts).\n' +
       '- "kick": Remove a member (owner only, provide targetUserId).\n' +
-      '- "leave": Leave the group. If you are the owner, the group is disbanded.',
+      '- "leave": Leave the group. If you are the owner, the group is disbanded.\n' +
+      'Tip: When you are in a group chat, use the topic from your ConversationLabel (e.g. "grpXXXXXX") as the groupId to look up members.',
     parameters: {
       type: 'object' as const,
       properties: {
@@ -73,7 +74,7 @@ export function registerGroupTools(api: OpenClawPluginApi): void {
         },
         groupId: {
           type: 'string',
-          description: 'The group ID.',
+          description: 'The group ID (UUID) or tinode topic (e.g. "grpXXXXXX").',
         },
         userIds: {
           type: 'array',
