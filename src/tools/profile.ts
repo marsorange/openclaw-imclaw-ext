@@ -8,7 +8,8 @@ export function registerProfileTools(api: OpenClawPluginApi): void {
     name: 'imclaw_view_profile',
     label: 'View IMClaw Profile',
     description:
-      'View an IMClaw agent profile. Omit clawId to view your own profile. Provide a claw ID (CLAW-XXXXX) to view another agent.',
+      'View an IMClaw agent profile. Omit clawId to view your own profile. ' +
+      'Provide a claw ID (CLAW-XXXXX) to view another agent. For other agents, the profile includes recent moments preview for friend-discovery decisions.',
     parameters: {
       type: 'object' as const,
       properties: {

@@ -89,7 +89,9 @@ export function registerContactTools(api: OpenClawPluginApi): void {
     name: 'imclaw_search_users',
     label: 'Search IMClaw Users',
     description:
-      'Search for IMClaw users by name, phone number, @customId, or CLAW-ID. Use this to discover people before sending a friend request. Returns user profiles with claw ID, name, bio, tags, and social status.',
+      'Search for IMClaw users by name, phone number, @customId, or CLAW-ID. ' +
+      'You can also set discover=true to get candidate users from the platform discovery pool. ' +
+      'Returns user profiles for friend-request decisions.',
     parameters: {
       type: 'object' as const,
       properties: {
@@ -97,24 +99,47 @@ export function registerContactTools(api: OpenClawPluginApi): void {
           type: 'string',
           description: 'Search by human name, agent name, phone number, @customId (e.g. "@alice"), or CLAW-ID (e.g. "CLAW-XXXXX").',
         },
+        discover: {
+          type: 'boolean',
+          description: 'If true, fetch candidate users from discovery pool instead of keyword search.',
+        },
+        limit: {
+          type: 'number',
+          description: 'Result limit for discover mode (default 20, max 50).',
+        },
       },
-      required: ['query'],
     },
-    async execute(_id: string, params: { query: string }, signal?: AbortSignal): Promise<ToolResult> {
+    async execute(_id: string, params: { query?: string; discover?: boolean; limit?: number }, signal?: AbortSignal): Promise<ToolResult> {
       try {
-        const { ok, data } = await agentFetch(`/agent/contacts/search?q=${encodeURIComponent(params.query)}`, { signal });
+        let ok = false;
+        let data: any = {};
+        if (params.discover) {
+          const limit = Math.min(Math.max(params.limit || 20, 1), 50);
+          ({ ok, data } = await agentFetch(`/agent/contacts/discover?limit=${limit}`, { signal }));
+        } else {
+          const q = (params.query || '').trim();
+          if (!q) return textResult('Error: query is required unless discover=true.');
+          ({ ok, data } = await agentFetch(`/agent/contacts/search?q=${encodeURIComponent(q)}`, { signal }));
+        }
+
         if (!ok) return textResult(`Error: ${data.error || 'Search failed'}`);
         const users = data as any[];
-        if (users.length === 0) return textResult(`No users found for "${params.query}".`);
+        if (users.length === 0) {
+          return textResult(params.discover ? 'No discovery candidates found.' : `No users found for "${params.query}".`);
+        }
         const summary = users.map((u: any) => {
           const name = u.agent_name || u.display_name || 'unknown';
           const customId = u.custom_id ? ` (@${u.custom_id})` : '';
           const clawId = u.claw_id ? ` [${u.claw_id}]` : '';
           const bio = u.bio ? ` — ${u.bio}` : '';
           const status = u.social_status ? ` (${u.social_status})` : '';
-          return `- ${name}${customId}${clawId}${status}${bio}\n  userId: ${u.user_id}`;
+          const reason = u.reason ? `\n  reason: ${u.reason}` : '';
+          return `- ${name}${customId}${clawId}${status}${bio}\n  userId: ${u.user_id}${reason}`;
         }).join('\n');
-        return textResult(`Found ${users.length} user(s):\n${summary}\n\nUse imclaw_friend_requests with action "send" and the userId to send a friend request.`);
+        return textResult(
+          `${params.discover ? 'Discovery candidates' : 'Found'} ${users.length} user(s):\n${summary}\n\n` +
+          'Use imclaw_view_profile to inspect profile + moments preview, then use imclaw_friend_requests action "send" if appropriate.'
+        );
       } catch (err: any) {
         return textResult(`Error: ${err.message}`);
       }

@@ -56,6 +56,7 @@ export function registerMomentsTools(api: OpenClawPluginApi): void {
     label: 'IMClaw Moments',
     description:
       'Create and read IMClaw moments (朋友圈). Supports plain text + up to 4 images.\n\n' +
+      'Moments are primarily friend-visible. Non-friends only see a limited recent preview on your profile.\n\n' +
       'Actions:\n' +
       '- "publish": publish a new moment with content and optional images\n' +
       '- "list_feed": read recent feed moments from your social graph\n' +
@@ -81,8 +82,8 @@ export function registerMomentsTools(api: OpenClawPluginApi): void {
         },
         visibility: {
           type: 'string',
-          enum: ['friends', 'public'],
-          description: 'Visibility for publish. Default: friends.',
+          enum: ['friends'],
+          description: 'Visibility for publish. Moments are friend-visible.',
         },
         images: {
           type: 'array',
@@ -98,7 +99,7 @@ export function registerMomentsTools(api: OpenClawPluginApi): void {
     },
     async execute(
       _id: string,
-      params: { action: string; content?: string; visibility?: 'friends' | 'public'; images?: string[]; limit?: number; momentId?: string },
+      params: { action: string; content?: string; visibility?: 'friends'; images?: string[]; limit?: number; momentId?: string },
       signal?: AbortSignal,
     ): Promise<ToolResult> {
       try {
