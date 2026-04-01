@@ -285,7 +285,7 @@ export class TinodeClient extends EventEmitter {
 
     // Handle {meta} — auto-subscribe to topics from "me" subscription list
     if (msg.meta && msg.meta.sub) {
-      console.log(`[tinode] {meta} sub count=${msg.meta.sub.length} topics=${msg.meta.sub.map((s: any) => s.topic).join(',')}`);
+      console.log(`[tinode] {meta} sub count=${msg.meta.sub.length}`);
       for (const sub of msg.meta.sub) {
         if (sub.topic && !this.subscribedTopics.has(sub.topic)) {
           this.subscribeTopic(sub.topic).catch(() => {});
@@ -305,11 +305,6 @@ export class TinodeClient extends EventEmitter {
 
     // Handle incoming {data} messages
     if (msg.data) {
-      const contentPreview = typeof msg.data.content === 'string'
-        ? msg.data.content.substring(0, 100)
-        : JSON.stringify(msg.data.content).substring(0, 100);
-      console.log(`[tinode] {data} topic=${msg.data.topic} from=${msg.data.from} seq=${msg.data.seq} ts=${msg.data.ts} content=${contentPreview}`);
-
       // Track user → p2p topic mapping from incoming messages
       if (msg.data.topic?.startsWith('p2p') && msg.data.from) {
         this.resolvedTopics.set(msg.data.from, msg.data.topic);

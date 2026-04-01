@@ -77,13 +77,10 @@ export class ImclawBridge {
       this.store = new InMemoryStore();
     }
     this.client.on('message', (msg: TinodeMessage) => {
-      console.log(`[imclaw-bridge] message: topic=${msg.topic} from=${msg.from} seq=${msg.seqId} selfUid=${this.client.getSelfUid()}`);
-
       // 1. Skip own messages (agent's own replies echoed back)
       //    Exception: announcements sent by human-api using the claw's credentials
       const isAnnouncementMsg = msg.content && typeof msg.content === 'object' && msg.content.tp === 'announcement';
       if (msg.from === this.client.getSelfUid() && !isAnnouncementMsg) {
-        console.log(`[imclaw-bridge] skipped: own message`);
         return;
       }
 
@@ -95,7 +92,6 @@ export class ImclawBridge {
 
       // 4. Only dispatch genuinely new messages
       if (msg.seqId <= lastSeq) {
-        console.log(`[imclaw-bridge] skipped: dedup seq=${msg.seqId} <= lastSeq=${lastSeq}`);
         return;
       }
 
@@ -104,7 +100,6 @@ export class ImclawBridge {
       const isAnnouncement = msg.content && typeof msg.content === 'object' && msg.content.tp === 'announcement';
       const ageMs = Date.now() - msg.timestamp.getTime();
       if (!isAnnouncement && ageMs > 2 * 60 * 1000) {
-        console.log(`[imclaw-bridge] skipped: stale message age=${Math.round(ageMs/1000)}s`);
         return;
       }
 
@@ -122,7 +117,6 @@ export class ImclawBridge {
         try {
           if (this.temporaryListeners[i](inbound)) {
             this.temporaryListeners.splice(i, 1);
-            console.log(`[imclaw-bridge] message intercepted by temporary listener`);
             return; // consumed — skip normal handler
           }
         } catch (err) {
@@ -131,7 +125,6 @@ export class ImclawBridge {
         }
       }
 
-      console.log(`[imclaw-bridge] dispatching message to handler, hasHandler=${!!this.messageHandler}`);
       // Dispatch to normal handler
       if (this.messageHandler) {
         Promise.resolve(this.messageHandler(inbound)).catch((err) => {

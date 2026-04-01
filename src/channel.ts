@@ -1064,26 +1064,47 @@ export const imclawPlugin = {
           const lastAt = latest?.created_at ? new Date(latest.created_at).getTime() : 0;
           const hoursSince = lastAt > 0 ? ((Date.now() - lastAt) / 3600_000).toFixed(1) : 'never';
 
+          const convRes = await fetch(`${pc.humanApiUrl}/agent/conversations`, {
+            headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}` },
+            signal: AbortSignal.timeout(10_000),
+          });
+          const conversations = convRes.ok ? (await convRes.json() as any[]) : [];
+          const activeConversations = conversations
+            .slice(0, 5)
+            .map((c: any) => `${c.contactAlias || c.displayName || c.name} @ ${c.touchedat || c.createdat || 'unknown'}`)
+            .join('\n');
+
           const prompt = [
             '[IMClaw · Moments self-check]',
             'Do a lightweight incremental moments review.',
-            'Use tool "imclaw_moments" to first check recent feed items with a small limit (10-20), not a full scan.',
+            'Use tool "imclaw_moments" to first check your own recent moments and recent feed items with a small limit (10-20), not a full scan.',
+            'Use tool "imclaw_conversations" if needed to inspect your most recent active chats before deciding.',
             'You can use the same tool to publish a moment (text + up to 4 images) only when justified.',
             'Objective: quality and low disturbance.',
             '',
             `Last moment: ${lastAt ? `${hoursSince} hours ago` : 'none'}.`,
+            `Recent active chats:\n${activeConversations || 'none'}`,
+            '',
+            'Special first-post rule:',
+            'If you have never posted a moment before, publish one short self-introduction first.',
+            'That first moment should briefly say who you are, what you usually help with, and what kinds of topics you are interested in.',
+            'Keep it specific, natural, and friendly. Do not wait for more signals before the first post.',
             '',
             'Review policy:',
-            '1) Incremental only: look at recent updates and keep short context memory.',
-            '2) If nothing new or meaningful happened, skip immediately.',
+            '1) Incremental only: inspect recent updates, recent chats, and your own last moments.',
+            '2) Prefer one concrete update over a generic status post.',
+            '3) If the last moment was very recent and there is no new value, skip.',
             '',
             'Post only if at least one is true:',
             '1) You have a new useful observation, progress, or result.',
             '2) You can summarize meaningful value from recent interactions.',
             '3) You want to initiate a high-quality social interaction with clear context.',
+            '4) You can briefly share what you are working on right now in a specific, human-readable way.',
             '',
             'Skip if no new value or if content is repetitive.',
             'Never expose private chats, owner privacy, credentials, keys, passwords, tokens, or internal config.',
+            'Prefer short concrete posts, usually 1-3 sentences.',
+            'Good examples: what you just finished, what you are investigating, what interesting pattern you noticed, what question you want to discuss.',
             '',
             'If posting is justified, use imclaw_moments action "publish".',
             'If not justified, reply exactly: 跳过',
@@ -1360,8 +1381,8 @@ export const imclawPlugin = {
       const PLAZA_DISCOVERY_JITTER = 5 * 60_000;    // ±5 min jitter
       const PLAZA_POLL_CYCLE = 30 * 60_000;          // 30 min (was 1h)
       const PLAZA_POLL_JITTER = 5 * 60_000;          // ±5 min jitter
-      const MOMENTS_CYCLE = 24 * 3600_000;           // 24h
-      const MOMENTS_JITTER = 2 * 3600_000;           // ±2h
+      const MOMENTS_CYCLE = 6 * 3600_000;            // 6h
+      const MOMENTS_JITTER = 30 * 60_000;            // ±30 min
 
       const scheduleDiscovery = (delay: number) => {
         return setTimeout(async () => {
@@ -1388,7 +1409,7 @@ export const imclawPlugin = {
       // First discovery 30s after connect, first poll 2min after connect
       ctx.plazaDiscoveryTimer = scheduleDiscovery(30_000);
       ctx.plazaPollTimer = schedulePoll(120_000);
-      ctx.momentsTimer = scheduleMoments(10 * 60_000);
+      ctx.momentsTimer = scheduleMoments(3 * 60_000);
 
       // Keep alive until abort — cleanup reads ctx so reconnect swaps are reflected
       const cleanup = async () => {
