@@ -5,6 +5,7 @@ import type { PluginRuntime } from 'openclaw/plugin-sdk';
 import { ImclawBridge, ChannelConfig } from './imclaw-bridge.js';
 import { downloadMedia, getMediaPath } from './media-store.js';
 import { imclawOnboardingAdapter } from './onboarding.js';
+import { runWithToolAccount } from './tools/tool-account-context.js';
 
 // ─── URL validation (SSRF protection) ───
 
@@ -355,67 +356,69 @@ function registerMessageHandler(
         : rawCtx;
 
       log?.info?.(`[imclaw-channel] dispatching sessionKey=${sessionKey} agentId=${route?.agentId || 'default'}`);
-      await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-        ctx: msgCtx,
-        cfg: currentCfg,
-        dispatcherOptions: {
-          deliver: async (payload: { text?: string; body?: string; mediaUrl?: string; mediaUrls?: string[] }) => {
-            log?.info?.(`[imclaw-channel] deliver callback: text=${(payload?.text || payload?.body || '').substring(0, 80)} mediaUrl=${payload?.mediaUrl || 'none'}`);
-            try {
-              const replyText = (payload?.text ?? payload?.body)?.trim();
-              if (replyText) {
-                // Detect thinking block error before sending
-                if (isThinkingBlockError(replyText)) {
-                  thinkingErrorDetected = true;
-                  log?.warn?.(`[imclaw-channel] thinking block error detected in reply, will retry with new session`);
-                }
+      await runWithToolAccount(routeAccountId, async () => {
+        await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+          ctx: msgCtx,
+          cfg: currentCfg,
+          dispatcherOptions: {
+            deliver: async (payload: { text?: string; body?: string; mediaUrl?: string; mediaUrls?: string[] }) => {
+              log?.info?.(`[imclaw-channel] deliver callback: text=${(payload?.text || payload?.body || '').substring(0, 80)} mediaUrl=${payload?.mediaUrl || 'none'}`);
+              try {
+                const replyText = (payload?.text ?? payload?.body)?.trim();
+                if (replyText) {
+                  // Detect thinking block error before sending
+                  if (isThinkingBlockError(replyText)) {
+                    thinkingErrorDetected = true;
+                    log?.warn?.(`[imclaw-channel] thinking block error detected in reply, will retry with new session`);
+                  }
 
-                const MAX_CHUNK = 4000;
-                if (replyText.length <= MAX_CHUNK) {
-                  await bridge.sendMessage(msg.topic, replyText);
-                } else {
-                  const chunks: string[] = [];
-                  let remaining = replyText;
-                  while (remaining.length > 0) {
-                    if (remaining.length <= MAX_CHUNK) {
-                      chunks.push(remaining);
-                      break;
+                  const MAX_CHUNK = 4000;
+                  if (replyText.length <= MAX_CHUNK) {
+                    await bridge.sendMessage(msg.topic, replyText);
+                  } else {
+                    const chunks: string[] = [];
+                    let remaining = replyText;
+                    while (remaining.length > 0) {
+                      if (remaining.length <= MAX_CHUNK) {
+                        chunks.push(remaining);
+                        break;
+                      }
+                      let splitAt = remaining.lastIndexOf('\n\n', MAX_CHUNK);
+                      if (splitAt < MAX_CHUNK * 0.3) splitAt = remaining.lastIndexOf('\n', MAX_CHUNK);
+                      if (splitAt < MAX_CHUNK * 0.3) splitAt = MAX_CHUNK;
+                      chunks.push(remaining.slice(0, splitAt).trimEnd());
+                      remaining = remaining.slice(splitAt).trimStart();
                     }
-                    let splitAt = remaining.lastIndexOf('\n\n', MAX_CHUNK);
-                    if (splitAt < MAX_CHUNK * 0.3) splitAt = remaining.lastIndexOf('\n', MAX_CHUNK);
-                    if (splitAt < MAX_CHUNK * 0.3) splitAt = MAX_CHUNK;
-                    chunks.push(remaining.slice(0, splitAt).trimEnd());
-                    remaining = remaining.slice(splitAt).trimStart();
+                    for (const chunk of chunks) {
+                      await bridge.sendMessage(msg.topic, chunk);
+                    }
                   }
-                  for (const chunk of chunks) {
-                    await bridge.sendMessage(msg.topic, chunk);
+                  log?.info?.(`[imclaw] → ${msg.topic} reply ${replyText.length} chars`);
+                }
+
+                const mediaUrls = payload?.mediaUrls ?? (payload?.mediaUrl ? [payload.mediaUrl] : []);
+                for (const url of mediaUrls) {
+                  // Use OpenClaw's standard loadWebMedia to resolve media
+                  // (handles remote URLs, local paths, file:// URIs, tilde paths — same as WhatsApp/Telegram)
+                  const { loadWebMedia } = await import('openclaw/plugin-sdk');
+                  const localRoots = [os.tmpdir(), '/tmp', '/private/tmp', mediaDir];
+                  const media = await loadWebMedia(url, { localRoots });
+                  const fileName = media.fileName || url.split('/').pop()?.split('?')[0] || 'media';
+                  const mime = media.contentType || 'application/octet-stream';
+
+                  if (media.kind === 'image') {
+                    await bridge.sendImage(msg.topic, media.buffer, fileName, mime);
+                  } else {
+                    await bridge.sendFile(msg.topic, media.buffer, fileName, mime);
                   }
+                  log?.info?.(`[imclaw] → ${msg.topic} media (${media.kind}): ${fileName} ${(media.buffer.length / 1024).toFixed(1)}KB`);
                 }
-                log?.info?.(`[imclaw] → ${msg.topic} reply ${replyText.length} chars`);
+              } catch (deliverErr: any) {
+                log?.error?.(`[imclaw] deliver error ${msg.topic}: ${deliverErr.message}`);
               }
-
-              const mediaUrls = payload?.mediaUrls ?? (payload?.mediaUrl ? [payload.mediaUrl] : []);
-              for (const url of mediaUrls) {
-                // Use OpenClaw's standard loadWebMedia to resolve media
-                // (handles remote URLs, local paths, file:// URIs, tilde paths — same as WhatsApp/Telegram)
-                const { loadWebMedia } = await import('openclaw/plugin-sdk');
-                const localRoots = [os.tmpdir(), '/tmp', '/private/tmp', mediaDir];
-                const media = await loadWebMedia(url, { localRoots });
-                const fileName = media.fileName || url.split('/').pop()?.split('?')[0] || 'media';
-                const mime = media.contentType || 'application/octet-stream';
-
-                if (media.kind === 'image') {
-                  await bridge.sendImage(msg.topic, media.buffer, fileName, mime);
-                } else {
-                  await bridge.sendFile(msg.topic, media.buffer, fileName, mime);
-                }
-                log?.info?.(`[imclaw] → ${msg.topic} media (${media.kind}): ${fileName} ${(media.buffer.length / 1024).toFixed(1)}KB`);
-              }
-            } catch (deliverErr: any) {
-              log?.error?.(`[imclaw] deliver error ${msg.topic}: ${deliverErr.message}`);
-            }
+            },
           },
-        },
+        });
       });
     };
 
@@ -1023,15 +1026,17 @@ export const imclawPlugin = {
           ? rt.channel.reply.finalizeInboundContext(rawCtx)
           : rawCtx;
 
-        await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
-          ctx: msgCtx,
-          cfg: currentCfg,
-          dispatcherOptions: {
-            deliver: async (payload: { text?: string; body?: string }) => {
-              const text = (payload?.text ?? payload?.body)?.trim();
-              if (text) collectedReply = text;
+        await runWithToolAccount(accountId, async () => {
+          await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+            ctx: msgCtx,
+            cfg: currentCfg,
+            dispatcherOptions: {
+              deliver: async (payload: { text?: string; body?: string }) => {
+                const text = (payload?.text ?? payload?.body)?.trim();
+                if (text) collectedReply = text;
+              },
             },
-          },
+          });
         });
 
         return collectedReply;
@@ -1588,6 +1593,15 @@ export function getAccountBridge(accountId: string): ImclawBridge | undefined {
 export function getOwnerTinodeUid(accountId?: string): string | null {
   const ctx = findAccountContext(accountId);
   return ctx?.ownerTinodeUid ?? null;
+}
+
+/**
+ * Get auth payload for a connected account, for tool-side API calls.
+ */
+export function getAccountAuth(accountId?: string | null): { auth: string; humanApiUrl: string } | null {
+  const ctx = findAccountContext(accountId);
+  if (!ctx) return null;
+  return { auth: ctx.heartbeatAuth, humanApiUrl: ctx.humanApiUrl };
 }
 
 /**

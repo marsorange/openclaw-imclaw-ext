@@ -1,4 +1,5 @@
-import { loadCredsCache, getHumanApiUrl } from '../channel.js';
+import { loadCredsCache, getHumanApiUrl, getAccountAuth } from '../channel.js';
+import { getToolAccountId } from './tool-account-context.js';
 
 export type ToolResult = { content: { type: 'text'; text: string }[]; details: unknown };
 
@@ -7,6 +8,13 @@ export function textResult(text: string): ToolResult {
 }
 
 export function getAuth(): { auth: string; humanApiUrl: string } | null {
+  const toolAccountId = getToolAccountId();
+  const accountAuth = getAccountAuth(toolAccountId);
+  if (accountAuth) return accountAuth;
+
+  const fallbackAuth = getAccountAuth();
+  if (fallbackAuth) return fallbackAuth;
+
   const cache = loadCredsCache();
   const entries = Object.values(cache);
   if (entries.length === 0) return null;
