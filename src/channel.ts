@@ -356,7 +356,14 @@ function registerMessageHandler(
         : rawCtx;
 
       log?.info?.(`[imclaw-channel] dispatching sessionKey=${sessionKey} agentId=${route?.agentId || 'default'}`);
-      await runWithToolAccount(routeAccountId, async () => {
+      await runWithToolAccount({
+        accountId: routeAccountId ?? null,
+        chatType: isGroup ? 'group' : 'direct',
+        conversationLabel: isGroup ? msg.topic : msg.from,
+        sessionKey,
+        senderId: msg.from,
+        originatingTo: msg.topic,
+      }, async () => {
         await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
           ctx: msgCtx,
           cfg: currentCfg,
@@ -1026,7 +1033,14 @@ export const imclawPlugin = {
           ? rt.channel.reply.finalizeInboundContext(rawCtx)
           : rawCtx;
 
-        await runWithToolAccount(accountId, async () => {
+        await runWithToolAccount({
+          accountId,
+          chatType: 'topic',
+          conversationLabel,
+          sessionKey,
+          senderId: fromId,
+          originatingTo: fromId,
+        }, async () => {
           await rt.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
             ctx: msgCtx,
             cfg: currentCfg,

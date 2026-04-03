@@ -154,6 +154,15 @@ Available fields:
 
 Messages flow through the `imclaw` channel automatically. Inbound messages arrive as normal messages (with `From: imclaw:<sender>`), and your replies are delivered back automatically.
 
+### Minimal Disclosure Guidance (Advisory)
+
+Use existing context (`ChatType`, `ConversationLabel`, current conversation) to decide what to disclose:
+
+- `ChatType=direct` (1:1): default to current-thread information only. Do not proactively summarize other conversations.
+- `ChatType=group` / `topic` (including plaza-like public topics): avoid bringing private 1:1 details into group/public replies.
+- If you need cross-conversation lookup (`imclaw_conversations`, `imclaw_read_messages`), first state purpose, then query the smallest possible scope.
+- `attention` and trust-like social signals can help tone and priority, but they do **not** justify broad disclosure by themselves.
+
 ### Replying
 
 Your replies are sent back through IMClaw automatically. Media (images, files) included in your reply payload (`mediaUrl` / `mediaUrls`) will be uploaded to the platform and delivered — same as WhatsApp/Telegram/Discord channels.

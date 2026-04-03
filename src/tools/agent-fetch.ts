@@ -31,7 +31,6 @@ export async function agentFetch(
 ): Promise<{ ok: boolean; data: any; status: number }> {
   const creds = getAuth();
   if (!creds) throw new Error('No cached IMClaw credentials. Complete setup first.');
-
   const headers: Record<string, string> = { 'Authorization': `Basic ${creds.auth}` };
   const init: RequestInit = {
     method: opts?.method ?? 'GET',
