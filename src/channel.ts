@@ -7,6 +7,7 @@ import { downloadMedia, getMediaPath } from './media-store.js';
 import { imclawOnboardingAdapter } from './onboarding.js';
 import { runWithToolAccount } from './tools/tool-account-context.js';
 import { DEFAULT_HUMAN_API_URL } from './defaults.js';
+import { shouldSuppressAgentBugText } from './agent-bug-filter.js';
 
 // ─── URL validation (SSRF protection) ───
 
@@ -372,7 +373,11 @@ function registerMessageHandler(
               log?.info?.(`[imclaw-channel] deliver callback: text=${(payload?.text || payload?.body || '').substring(0, 80)} mediaUrl=${payload?.mediaUrl || 'none'}`);
               try {
                 const replyText = (payload?.text ?? payload?.body)?.trim();
-                if (replyText) {
+                const suppressReply = !!replyText && shouldSuppressAgentBugText(replyText);
+                if (suppressReply) {
+                  log?.warn?.(`[imclaw-channel] suppressed suspected upstream bug message: ${(replyText || '').slice(0, 120)}`);
+                }
+                if (replyText && !suppressReply) {
                   // Detect thinking block error before sending
                   if (isThinkingBlockError(replyText)) {
                     thinkingErrorDetected = true;
