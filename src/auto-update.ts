@@ -1,77 +1,19 @@
-import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
-import { exec, spawn } from 'node:child_process';
-import { promisify } from 'node:util';
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import { DEFAULT_HUMAN_API_URL } from './defaults.js';
-
-const execAsync = promisify(exec);
-const AUTO_UPDATE_DIR = path.join(os.homedir(), '.openclaw', 'imclaw');
-const AUTO_UPDATE_STATE_PATH = path.join(AUTO_UPDATE_DIR, 'auto-update-state.json');
-const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
-const CHECK_JITTER_MS = 30 * 60 * 1000;
-const MAX_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
-const STARTUP_DELAY_MS = 2 * 60 * 1000;
-const UPDATE_ATTEMPT_BACKOFF_MS = 6 * 60 * 60 * 1000;
-const FETCH_TIMEOUT_MS = 15_000;
-
-interface AutoUpdateState {
-  lastCheckedAt?: number;
-  lastAttemptedUpdateAt?: number;
-  lastSuccessfulUpdateAt?: number;
-  lastSeenMinimumVersion?: string | null;
-  lastError?: string | null;
-}
 
 interface PluginPolicyResponse {
   minimumVersion?: string | null;
 }
 
+const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const CHECK_JITTER_MS = 30 * 60 * 1000;
+const STARTUP_DELAY_MS = 2 * 60 * 1000;
+const FETCH_TIMEOUT_MS = 15_000;
+
 let activeApi: OpenClawPluginApi | null = null;
 let activeVersion = '0.0.0';
 let timer: NodeJS.Timeout | null = null;
-let loopStarted = false;
-let checkInFlight = false;
-
-function readState(): AutoUpdateState {
-  try {
-    if (!fs.existsSync(AUTO_UPDATE_STATE_PATH)) return {};
-    return JSON.parse(fs.readFileSync(AUTO_UPDATE_STATE_PATH, 'utf-8')) as AutoUpdateState;
-  } catch {
-    return {};
-  }
-}
-
-function writeState(next: AutoUpdateState): void {
-  fs.mkdirSync(AUTO_UPDATE_DIR, { recursive: true });
-  fs.writeFileSync(AUTO_UPDATE_STATE_PATH, JSON.stringify(next, null, 2), { mode: 0o600 });
-}
-
-function scheduleNext(delayMs: number): void {
-  if (timer) clearTimeout(timer);
-  const boundedDelay = Math.min(Math.max(delayMs, 60_000), MAX_CHECK_INTERVAL_MS);
-  timer = setTimeout(() => {
-    void runCheck();
-  }, boundedDelay);
-}
-
-function computeRecurringDelay(): number {
-  const jitter = Math.round((Math.random() - 0.5) * 2 * CHECK_JITTER_MS);
-  return CHECK_INTERVAL_MS + jitter;
-}
-
-function computeInitialDelay(state: AutoUpdateState): number {
-  const now = Date.now();
-  const lastCheckedAt = state.lastCheckedAt ?? 0;
-  const elapsed = now - lastCheckedAt;
-  if (!lastCheckedAt || elapsed >= CHECK_INTERVAL_MS) return STARTUP_DELAY_MS;
-  return Math.min(CHECK_INTERVAL_MS - elapsed, MAX_CHECK_INTERVAL_MS);
-}
-
-function getLogger() {
-  return activeApi?.logger ?? console;
-}
+let started = false;
 
 function parseVersion(version: string): { main: number[]; pre: string[] } | null {
   const trimmed = version.trim();
@@ -118,6 +60,18 @@ function compareVersions(left: string, right: string): number {
   return 0;
 }
 
+function scheduleNext(delayMs: number): void {
+  if (timer) clearTimeout(timer);
+  timer = setTimeout(() => {
+    void runCheck();
+  }, Math.max(delayMs, 60_000));
+}
+
+function recurringDelay(): number {
+  const jitter = Math.round((Math.random() - 0.5) * 2 * CHECK_JITTER_MS);
+  return CHECK_INTERVAL_MS + jitter;
+}
+
 async function resolveHumanApiUrl(): Promise<string> {
   const runtimeConfig = activeApi?.runtime
     ? await Promise.resolve(activeApi.runtime.config.loadConfig() as Record<string, any>)
@@ -125,121 +79,52 @@ async function resolveHumanApiUrl(): Promise<string> {
   const value = runtimeConfig?.plugins?.entries?.imclaw?.config?.humanApiUrl
     || activeApi?.pluginConfig?.humanApiUrl
     || DEFAULT_HUMAN_API_URL;
-
   const parsed = new URL(value);
   return parsed.toString().replace(/\/$/, '');
 }
 
-function getOpenClawBin(): string {
-  return process.env.OPENCLAW_BIN || 'openclaw';
-}
-
-function shellQuote(arg: string): string {
-  if (process.platform === 'win32') {
-    if (/[\s"&|<>^%!]/.test(arg)) return `"${arg.replace(/"/g, '\\"')}"`;
-    return arg;
-  }
-  if (/[\s"'\\$`!#&|;<>(){}[\]*?~]/.test(arg)) return `'${arg.replace(/'/g, "'\\''")}'`;
-  return arg;
-}
-
-async function fetchPolicy(humanApiUrl: string): Promise<PluginPolicyResponse> {
-  const res = await fetch(`${humanApiUrl}/public/plugin-policy`, {
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-  });
-  if (!res.ok) {
-    throw new Error(`plugin policy fetch failed: HTTP ${res.status}`);
-  }
-  return res.json() as Promise<PluginPolicyResponse>;
-}
-
-async function runOpenClaw(args: string[], timeout: number): Promise<void> {
-  const command = [getOpenClawBin(), ...args.map(shellQuote)].join(' ');
-  await execAsync(command, {
-    timeout,
-    windowsHide: true,
-  });
-}
-
-function scheduleGatewayRestart(): void {
-  const child = spawn(getOpenClawBin(), ['gateway', 'restart'], {
-    detached: true,
-    shell: process.platform === 'win32',
-    stdio: 'ignore',
-  });
-  child.on('error', (err) => {
-    getLogger().error?.(`[imclaw] gateway restart command failed: ${err.message}`);
-  });
-  child.unref();
-}
-
 async function runCheck(): Promise<void> {
-  if (!activeApi || checkInFlight) {
-    scheduleNext(computeRecurringDelay());
-    return;
-  }
-
-  checkInFlight = true;
-  const state = readState();
-  const logger = getLogger();
-  const now = Date.now();
-
   try {
+    if (!activeApi) return;
+    const logger = activeApi.logger ?? console;
     const humanApiUrl = await resolveHumanApiUrl();
-    const policy = await fetchPolicy(humanApiUrl);
+    const res = await fetch(`${humanApiUrl}/public/plugin-policy`, {
+      signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    });
+    if (!res.ok) {
+      logger.warn?.(`[imclaw] plugin policy check failed: HTTP ${res.status}`);
+      return;
+    }
+    const policy = await res.json() as PluginPolicyResponse;
     const minimumVersion = policy.minimumVersion?.trim() || null;
 
-    state.lastCheckedAt = now;
-    state.lastSeenMinimumVersion = minimumVersion;
-    state.lastError = null;
-    writeState(state);
-
-    if (!minimumVersion) {
-      logger.info?.('[imclaw] auto-update check: no minimum version configured');
-      return;
+    if (!minimumVersion) return;
+    if (compareVersions(activeVersion, minimumVersion) < 0) {
+      logger.warn?.(
+        `[imclaw] plugin upgrade required: current=${activeVersion}, minimum=${minimumVersion}. ` +
+        `Please run: openclaw plugins update imclaw && openclaw gateway restart`,
+      );
     }
-
-    if (compareVersions(activeVersion, minimumVersion) >= 0) {
-      logger.info?.(`[imclaw] auto-update check: current version ${activeVersion} satisfies minimum ${minimumVersion}`);
-      return;
-    }
-
-    if (state.lastAttemptedUpdateAt && now - state.lastAttemptedUpdateAt < UPDATE_ATTEMPT_BACKOFF_MS) {
-      logger.warn?.(`[imclaw] auto-update pending: current ${activeVersion}, minimum ${minimumVersion}, waiting for retry window`);
-      return;
-    }
-
-    logger.warn?.(`[imclaw] auto-update required: current ${activeVersion}, minimum ${minimumVersion}`);
-    state.lastAttemptedUpdateAt = now;
-    writeState(state);
-
-    await runOpenClaw(['plugins', 'update', 'imclaw'], 10 * 60 * 1000);
-
-    state.lastSuccessfulUpdateAt = Date.now();
-    state.lastError = null;
-    writeState(state);
-
-    logger.warn?.('[imclaw] plugin updated successfully, restarting gateway to load the new version');
-    scheduleGatewayRestart();
   } catch (err: any) {
-    state.lastCheckedAt = now;
-    state.lastError = err?.message || String(err);
-    writeState(state);
-    logger.error?.(`[imclaw] auto-update check failed: ${state.lastError}`);
+    (activeApi?.logger ?? console).warn?.(`[imclaw] plugin policy check error: ${err.message}`);
   } finally {
-    checkInFlight = false;
-    scheduleNext(computeRecurringDelay());
+    scheduleNext(recurringDelay());
   }
 }
 
-export function startAutoUpdateLoop(api: OpenClawPluginApi, currentVersion: string): void {
+/**
+ * Version policy check loop.
+ *
+ * This intentionally does NOT auto-update plugins. It only checks whether
+ * the current plugin version satisfies server policy and logs a manual action hint.
+ */
+export function startPluginPolicyCheckLoop(api: OpenClawPluginApi, currentVersion: string): void {
   activeApi = api;
-  activeVersion = currentVersion;
-
-  if (loopStarted) return;
-  loopStarted = true;
-
-  const initialDelay = computeInitialDelay(readState());
-  getLogger().info?.(`[imclaw] auto-update loop started, first check in ${Math.round(initialDelay / 60_000)} minute(s)`);
-  scheduleNext(initialDelay);
+  activeVersion = currentVersion || '0.0.0';
+  if (started) return;
+  started = true;
+  scheduleNext(STARTUP_DELAY_MS);
 }
+
+// Backward compatibility alias.
+export const startAutoUpdateLoop = startPluginPolicyCheckLoop;

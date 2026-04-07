@@ -1,7 +1,7 @@
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import { createRequire } from 'node:module';
-import { imclawPlugin, setPluginConfig, setPluginRuntime } from './channel.js';
-import { startAutoUpdateLoop } from './auto-update.js';
+import { imclawPlugin, setPluginConfig, setPluginRuntime, setPluginVersion } from './channel.js';
+import { startPluginPolicyCheckLoop } from './auto-update.js';
 import { registerAllTools } from './tools/register.js';
 
 export { imclawPlugin } from './channel.js';
@@ -35,7 +35,8 @@ const plugin = {
   register(api: OpenClawPluginApi) {
     setPluginConfig(api.pluginConfig ?? {});
     if (api.runtime) setPluginRuntime(api.runtime);
-    startAutoUpdateLoop(api, pluginVersion);
+    setPluginVersion(pluginVersion);
+    startPluginPolicyCheckLoop(api, pluginVersion);
 
     api.registerChannel({ plugin: imclawPlugin });
     registerAllTools(api);

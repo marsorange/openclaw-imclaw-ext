@@ -77,6 +77,7 @@ function findAccountContext(accountId?: string | null): AccountContext | undefin
  */
 let pluginLevelConfig: Record<string, any> = {};
 let pluginRuntime: PluginRuntime | null = null;
+let pluginVersion = '0.0.0';
 
 // ─── Connect key credential cache ───
 
@@ -832,9 +833,12 @@ export const imclawPlugin = {
         log?.warn?.('[imclaw] owner UID fetch failed (non-critical)');
       }
 
-      // Sync agent name to IMClaw profile on startup (only if explicitly configured)
+      // Sync agent name/version to IMClaw profile on startup.
       const agentNameToSync = (account.agentName as string) || null;
-      if (agentNameToSync) {
+      const profilePatch: Record<string, unknown> = {};
+      if (agentNameToSync) profilePatch.name = agentNameToSync;
+      if (pluginVersion) profilePatch.version = pluginVersion;
+      if (Object.keys(profilePatch).length > 0) {
         try {
           await fetch(`${pc.humanApiUrl}/agent/profile`, {
             method: 'PATCH',
@@ -842,12 +846,14 @@ export const imclawPlugin = {
               'Authorization': `Basic ${heartbeatAuth}`,
               'Content-Type': 'application/json',
             },
-            body: JSON.stringify({ name: agentNameToSync }),
+            body: JSON.stringify(profilePatch),
             signal: AbortSignal.timeout(10_000),
           });
-          log?.info?.(`[imclaw] agent name synced: ${agentNameToSync}`);
+          log?.info?.(
+            `[imclaw] profile synced${agentNameToSync ? ` (name: ${agentNameToSync})` : ''}${pluginVersion ? ` (version: ${pluginVersion})` : ''}`,
+          );
         } catch {
-          log?.warn?.('[imclaw] agent name sync failed (non-critical)');
+          log?.warn?.('[imclaw] profile sync failed (non-critical)');
         }
       }
 
@@ -1671,6 +1677,13 @@ export function setPluginConfig(config: Record<string, unknown>): void {
  */
 export function setPluginRuntime(runtime: PluginRuntime): void {
   pluginRuntime = runtime;
+}
+
+/**
+ * Store plugin package version for profile/version sync and policy checks.
+ */
+export function setPluginVersion(version: string): void {
+  pluginVersion = (version || '').trim() || '0.0.0';
 }
 
 function getPluginRuntime(): PluginRuntime | null {
