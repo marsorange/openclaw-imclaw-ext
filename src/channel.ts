@@ -1071,9 +1071,38 @@ export const imclawPlugin = {
         );
       };
 
+      // Owner feature toggles for autonomous social behaviors.
+      const getAutonomyFeatureSettings = async (): Promise<{
+        momentsAutopilotEnabled: boolean;
+        plazaAutopilotEnabled: boolean;
+      }> => {
+        try {
+          const res = await fetch(`${pc.humanApiUrl}/agent/settings`, {
+            headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}` },
+            signal: AbortSignal.timeout(10_000),
+          });
+          if (!res.ok) {
+            return { momentsAutopilotEnabled: true, plazaAutopilotEnabled: true };
+          }
+          const data = await res.json() as any;
+          return {
+            momentsAutopilotEnabled: data?.moments_autopilot_enabled !== false,
+            plazaAutopilotEnabled: data?.plaza_autopilot_enabled !== false,
+          };
+        } catch {
+          return { momentsAutopilotEnabled: true, plazaAutopilotEnabled: true };
+        }
+      };
+
       // Moments autonomy loop: periodically decide whether to post a moment.
       const runMomentsCheck = async () => {
         try {
+          const settings = await getAutonomyFeatureSettings();
+          if (!settings.momentsAutopilotEnabled) {
+            log?.info?.('[imclaw-moments] disabled by owner settings');
+            return;
+          }
+
           const mineRes = await fetch(`${pc.humanApiUrl}/agent/moments/mine?limit=1`, {
             headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}` },
             signal: AbortSignal.timeout(10_000),
@@ -1147,6 +1176,11 @@ export const imclawPlugin = {
 
       // Discovery: fetch available topics → present each to agent → join + post if agent replies
       const runDiscovery = async () => {
+        const settings = await getAutonomyFeatureSettings();
+        if (!settings.plazaAutopilotEnabled) {
+          log?.info?.('[imclaw-plaza] discovery disabled by owner settings');
+          return;
+        }
         reportPlazaActivity('discovery_start');
         try {
           // Fetch what the agent already joined to skip those
@@ -1331,6 +1365,12 @@ export const imclawPlugin = {
       // Poll: for already-joined topics, fetch new messages → dispatch → post reply
       const runPoll = async () => {
         try {
+          const settings = await getAutonomyFeatureSettings();
+          if (!settings.plazaAutopilotEnabled) {
+            log?.info?.('[imclaw-plaza] poll disabled by owner settings');
+            return;
+          }
+
           const myTopicsRes = await fetch(`${pc.humanApiUrl}/agent/plaza/my-topics`, {
             headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}` },
             signal: AbortSignal.timeout(15_000),
