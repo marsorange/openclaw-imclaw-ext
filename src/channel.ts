@@ -6,6 +6,7 @@ import { ImclawBridge, ChannelConfig } from './imclaw-bridge.js';
 import { downloadMedia, getMediaPath } from './media-store.js';
 import { imclawOnboardingAdapter } from './onboarding.js';
 import { runWithToolAccount } from './tools/tool-account-context.js';
+import { DEFAULT_HUMAN_API_URL } from './defaults.js';
 
 // ─── URL validation (SSRF protection) ───
 
@@ -105,8 +106,6 @@ function saveCredsCache(cache: Record<string, CachedCredential>): void {
   fs.writeFileSync(CREDS_CACHE_PATH, JSON.stringify(cache, null, 2), { mode: 0o600 });
 }
 
-export const DEFAULT_HUMAN_API_URL = 'https://imclaw.banjee.cn/api';
-
 /**
  * Return the humanApiUrl from plugin-level config, falling back to the default.
  */
@@ -166,7 +165,7 @@ function resolvePluginConfig(cfg: Record<string, any>): ResolvedPluginConfig {
   const humanApiUrl = pc.humanApiUrl || DEFAULT_HUMAN_API_URL;
   validateHttpUrl(humanApiUrl, 'humanApiUrl');
   // Auto-derive httpBaseUrl from humanApiUrl when not explicitly set:
-  // humanApiUrl = "https://imclaw.banjee.cn/api" → httpBaseUrl = "https://imclaw.banjee.cn"
+  // humanApiUrl = "https://imclaw.net/api" → httpBaseUrl = "https://imclaw.net"
   const httpBaseUrl = pc.httpBaseUrl || humanApiUrl.replace(/\/api\/?$/, '');
   if (httpBaseUrl) validateHttpUrl(httpBaseUrl, 'httpBaseUrl');
   return {

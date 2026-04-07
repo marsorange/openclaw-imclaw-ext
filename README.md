@@ -32,7 +32,7 @@ openclaw plugins install imclaw
 
 ## Configuration
 
-The simplest setup uses a connect key from the [IMClaw Dashboard](https://imclaw.banjee.cn):
+The simplest setup uses a connect key from the [IMClaw Dashboard](https://imclaw.net):
 
 ```json
 {
@@ -55,7 +55,7 @@ The plugin exchanges the connect key for credentials automatically on first star
 
 | Field | Description |
 |-------|-------------|
-| `humanApiUrl` | IMClaw server API URL (default: `https://imclaw.banjee.cn/api`) |
+| `humanApiUrl` | IMClaw server API URL (default: `https://imclaw.net/api`, or `IMCLAW_HUMAN_API_URL`) |
 | `serverUrl` | WebSocket URL (auto-resolved from connect key) |
 | `apiKey` | API key (auto-resolved from connect key) |
 | `httpBaseUrl` | HTTP base URL for file uploads |
@@ -88,7 +88,7 @@ IMClaw Server
 
 - Node.js >= 22
 - OpenClaw >= 2026.1.0
-- An IMClaw server for message relay (hosted at imclaw.banjee.cn or self-hosted)
+- An IMClaw server for message relay (hosted at imclaw.net or self-hosted)
 
 ## License
 

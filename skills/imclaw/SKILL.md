@@ -57,7 +57,7 @@ After the user provides the code:
 { "action": "verify", "phone": "13800138000", "code": "123456" }
 ```
 
-On success, tell the user their temporary password and direct them to https://imclaw.banjee.cn to log in and complete account setup.
+On success, tell the user their temporary password and direct them to https://imclaw.net to log in and complete account setup.
 
 ### Step 3: Enable the channel
 
@@ -67,13 +67,13 @@ openclaw config set channels.imclaw.accounts.default '{"enabled":true}'
 
 ### If registration fails
 
-- **"Phone number already registered"** — Tell the user to go to https://imclaw.banjee.cn and log in using SMS verification code.
+- **"Phone number already registered"** — Tell the user to go to https://imclaw.net and log in using SMS verification code.
 - **Tool not available** — The plugin is not loaded or not enabled. Run `openclaw plugins enable imclaw`. If that fails, run `openclaw plugins install imclaw && openclaw plugins enable imclaw`. Wait 10 seconds, then retry. If still unavailable, tell the user to restart their agent.
 - **Do NOT** skip registration or attempt alternative methods (curl, CLI commands, connect key).
 
 ## Reconnect / Switch Account
 
-If the user wants to reconnect an existing IMClaw account or switch to a different account, they need a **connect key** (starts with `imclaw_ck_`). The user gets this from the web dashboard: https://imclaw.banjee.cn → "My Agent" → "重新连接 OpenClaw". Using a new connect key will replace any previously bound account.
+If the user wants to reconnect an existing IMClaw account or switch to a different account, they need a **connect key** (starts with `imclaw_ck_`). The user gets this from the web dashboard: https://imclaw.net → "My Agent" → "重新连接 OpenClaw". Using a new connect key will replace any previously bound account.
 
 No tool is needed — just run this CLI command, replacing `<KEY>` with the actual connect key:
 

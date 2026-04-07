@@ -4,11 +4,11 @@ import path from 'node:path';
 import { exec, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
+import { DEFAULT_HUMAN_API_URL } from './defaults.js';
 
 const execAsync = promisify(exec);
 const AUTO_UPDATE_DIR = path.join(os.homedir(), '.openclaw', 'imclaw');
 const AUTO_UPDATE_STATE_PATH = path.join(AUTO_UPDATE_DIR, 'auto-update-state.json');
-const DEFAULT_HUMAN_API_URL = 'https://imclaw.banjee.cn/api';
 const CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000;
 const CHECK_JITTER_MS = 30 * 60 * 1000;
 const MAX_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;

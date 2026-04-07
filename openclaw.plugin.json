@@ -25,7 +25,7 @@
       },
       "humanApiUrl": {
         "type": "string",
-        "description": "IMClaw server HTTP API URL (default: https://imclaw.banjee.cn/api)"
+        "description": "IMClaw server HTTP API URL (default: https://imclaw.net/api or IMCLAW_HUMAN_API_URL)"
       },
       "accounts": {
         "type": "array",

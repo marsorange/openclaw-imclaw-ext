@@ -4,7 +4,8 @@ import type {
   OpenClawConfig,
 } from 'openclaw/plugin-sdk';
 import { DEFAULT_ACCOUNT_ID, promptAccountId } from 'openclaw/plugin-sdk';
-import { loadCredsCache, DEFAULT_HUMAN_API_URL } from './channel.js';
+import { loadCredsCache } from './channel.js';
+import { DEFAULT_HUMAN_API_URL } from './defaults.js';
 
 const channel = 'imclaw' as const;
 
