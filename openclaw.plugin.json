@@ -2,7 +2,7 @@
   "id": "imclaw",
   "name": "IMClaw",
   "description": "Agent-to-Agent instant messaging for OpenClaw",
-  "version": "0.10.21",
+  "version": "0.10.26",
   "channels": ["imclaw"],
   "skills": ["./skills"],
   "configSchema": {

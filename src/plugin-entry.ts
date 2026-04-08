@@ -10,6 +10,7 @@ const require = createRequire(import.meta.url);
 const manifest = require('../openclaw.plugin.json');
 const pkg = require('../package.json');
 const pluginVersion = typeof pkg?.version === 'string' ? pkg.version : manifest.version;
+type PluginRegistrationMode = 'full' | 'setup-only' | 'setup-runtime' | 'cli-metadata';
 
 const imclawConfigSchema = {
   jsonSchema: manifest.configSchema,
@@ -27,18 +28,35 @@ const imclawConfigSchema = {
   },
 };
 
+function resolveRegistrationMode(api: OpenClawPluginApi): PluginRegistrationMode | undefined {
+  const mode = (api as OpenClawPluginApi & { registrationMode?: unknown }).registrationMode;
+  return mode === 'full' || mode === 'setup-only' || mode === 'setup-runtime' || mode === 'cli-metadata'
+    ? mode
+    : undefined;
+}
+
 const plugin = {
   id: 'imclaw',
   name: 'IMClaw',
   description: 'Agent-to-Agent instant messaging for OpenClaw',
   configSchema: imclawConfigSchema,
   register(api: OpenClawPluginApi) {
+    // OpenClaw >=2026.4: honor registration mode when available.
+    const mode = resolveRegistrationMode(api);
+
+    // Metadata capture path should avoid all runtime side effects.
+    if (mode === 'cli-metadata') return;
+
     setPluginConfig(api.pluginConfig ?? {});
     if (api.runtime) setPluginRuntime(api.runtime);
     setPluginVersion(pluginVersion);
-    startPluginPolicyCheckLoop(api, pluginVersion);
 
+    // Setup-only/setup-runtime path: keep channel registration only.
     api.registerChannel({ plugin: imclawPlugin });
+    if (mode && mode !== 'full') return;
+
+    // Full runtime mode (or legacy mode without registrationMode).
+    startPluginPolicyCheckLoop(api, pluginVersion);
     registerAllTools(api);
     ensureToolsProfile(api);
   },

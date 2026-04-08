@@ -58,7 +58,7 @@
     "url": "https://github.com/marsorange/openclaw-imclaw-ext.git"
   },
   "engines": {
-    "node": ">=22"
+    "node": ">=22.14.0"
   },
   "scripts": {
     "build": "tsc",
