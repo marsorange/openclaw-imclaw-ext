@@ -41,7 +41,16 @@
     ],
     "install": {
       "npmSpec": "imclaw",
-      "defaultChoice": "npm"
+      "defaultChoice": "npm",
+      "minHostVersion": ">=2026.1.0"
+    },
+    "compat": {
+      "pluginApi": ">=2026.1.0",
+      "minGatewayVersion": "2026.1.0"
+    },
+    "build": {
+      "openclawVersion": "2026.4.8",
+      "pluginSdkVersion": "2026.4.8"
     }
   },
   "keywords": [
