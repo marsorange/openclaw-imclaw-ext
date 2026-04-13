@@ -8,6 +8,12 @@ import { imclawOnboardingAdapter } from './onboarding.js';
 import { runWithToolAccount } from './tools/tool-account-context.js';
 import { DEFAULT_HUMAN_API_URL } from './defaults.js';
 import { shouldSuppressAgentBugText } from './agent-bug-filter.js';
+import {
+  extractApprovalHintFromText,
+  resolveApprovalShortcutDecision,
+  type ApprovalDecision,
+  type ApprovalHint,
+} from './approval-shortcuts.js';
 
 // ─── URL validation (SSRF protection) ───
 
@@ -227,13 +233,76 @@ function setCorruptedSuffix(baseKey: string, suffix: string): void {
   corruptedSessionKeys.set(baseKey, { suffix, expiry: Date.now() + SESSION_KEY_TTL });
 }
 
+// ─── Approval shortcut bridging ───
+
+type PendingApprovalState = {
+  approvalId: string;
+  approvalSlug?: string;
+  allowedDecisions: ApprovalDecision[];
+  expiry: number;
+};
+
+const APPROVAL_SHORTCUT_TTL = 30 * 60 * 1000; // align with OpenClaw default approval timeout
+const MAX_PENDING_APPROVALS = 200;
+const pendingApprovals = new Map<string, PendingApprovalState>();
+
+function makeApprovalStateKey(accountId: string, topic: string): string {
+  return `${accountId}:${topic}`;
+}
+
+function prunePendingApprovals(now = Date.now()): void {
+  for (const [key, state] of pendingApprovals.entries()) {
+    if (state.expiry <= now) {
+      pendingApprovals.delete(key);
+    }
+  }
+  while (pendingApprovals.size > MAX_PENDING_APPROVALS) {
+    const oldestKey = pendingApprovals.keys().next().value as string | undefined;
+    if (!oldestKey) break;
+    pendingApprovals.delete(oldestKey);
+  }
+}
+
+function setPendingApproval(key: string, hint: ApprovalHint): void {
+  prunePendingApprovals();
+  pendingApprovals.set(key, {
+    approvalId: hint.approvalId,
+    approvalSlug: hint.approvalSlug,
+    allowedDecisions: hint.allowedDecisions,
+    expiry: Date.now() + APPROVAL_SHORTCUT_TTL,
+  });
+}
+
+function getPendingApproval(key: string): PendingApprovalState | undefined {
+  prunePendingApprovals();
+  return pendingApprovals.get(key);
+}
+
+function clearPendingApproval(key: string): void {
+  pendingApprovals.delete(key);
+}
+
 // ─── Reusable message handler ───
+
+function extractTrustedHosts(...urls: (string | undefined)[]): string[] {
+  const hosts: string[] = [];
+  for (const raw of urls) {
+    if (!raw) continue;
+    try {
+      const normalized = raw.startsWith('ws') ? raw.replace(/^ws/, 'http') : raw;
+      const hostname = new URL(normalized).hostname;
+      if (hostname && !hosts.includes(hostname)) hosts.push(hostname);
+    } catch { /* ignore */ }
+  }
+  return hosts;
+}
 
 function registerMessageHandler(
   bridge: ImclawBridge,
   accountId: string,
   log: any,
   mediaDir: string,
+  trustedHosts?: string[],
 ): void {
   const rt = getPluginRuntime();
 
@@ -273,7 +342,7 @@ function registerMessageHandler(
     // Auto-download media to workspace
     let localMediaPath: string | undefined;
     if (mediaUrl) {
-      const localFile = await downloadMedia(mediaUrl, msg.content.name || 'media', msg.seqId, mediaDir);
+      const localFile = await downloadMedia(mediaUrl, msg.content.name || 'media', msg.seqId, mediaDir, trustedHosts);
       if (localFile) {
         localMediaPath = getMediaPath(localFile, mediaDir);
       } else {
@@ -307,6 +376,7 @@ function registerMessageHandler(
 
     const routeSessionKey = route?.sessionKey;
     const routeAccountId = route?.accountId ?? accountId;
+    const approvalStateKey = makeApprovalStateKey(routeAccountId, msg.topic);
 
     // Fallback session key when routing API is unavailable (older OpenClaw versions)
     const baseSessionKey = routeSessionKey
@@ -318,6 +388,24 @@ function registerMessageHandler(
 
     // If this session was previously corrupted (within TTL), use the rotated suffix
     const existingSuffix = getCorruptedSuffix(baseSessionKey);
+
+    // Natural-language approval shortcuts:
+    // "确认/同意/拒绝" → "/approve <id> <decision>" when a pending approval exists.
+    const ownerUid = accounts.get(routeAccountId)?.ownerTinodeUid;
+    const isOwnerDirectMessage = !isGroup && (!ownerUid || ownerUid === msg.from);
+    if (text && isOwnerDirectMessage) {
+      const pending = getPendingApproval(approvalStateKey);
+      if (pending) {
+        const decision = resolveApprovalShortcutDecision(text, pending.allowedDecisions);
+        if (decision) {
+          text = `/approve ${pending.approvalId} ${decision}`;
+          clearPendingApproval(approvalStateKey);
+          log?.info?.(
+            `[imclaw-channel] mapped approval shortcut for ${msg.topic}: decision=${decision} id=${pending.approvalSlug || pending.approvalId}`,
+          );
+        }
+      }
+    }
 
     let thinkingErrorDetected = false;
 
@@ -378,6 +466,14 @@ function registerMessageHandler(
                   log?.warn?.(`[imclaw-channel] suppressed suspected upstream bug message: ${(replyText || '').slice(0, 120)}`);
                 }
                 if (replyText && !suppressReply) {
+                  const approvalHint = extractApprovalHintFromText(replyText);
+                  if (approvalHint) {
+                    setPendingApproval(approvalStateKey, approvalHint);
+                    log?.info?.(
+                      `[imclaw-channel] captured pending approval for ${msg.topic}: id=${approvalHint.approvalSlug || approvalHint.approvalId}`,
+                    );
+                  }
+
                   // Detect thinking block error before sending
                   if (isThinkingBlockError(replyText)) {
                     thinkingErrorDetected = true;
@@ -761,7 +857,8 @@ export const imclawPlugin = {
         log?.error?.('[imclaw] plugin runtime not available');
       }
 
-      registerMessageHandler(bridge, accountId, log, mediaDir);
+      const trustedHosts = extractTrustedHosts(pc.serverUrl, pc.httpBaseUrl, pc.humanApiUrl);
+      registerMessageHandler(bridge, accountId, log, mediaDir, trustedHosts);
 
       try {
         await bridge.start();
@@ -778,7 +875,7 @@ export const imclawPlugin = {
             log?.info?.(`[imclaw] retrying with alternate cached credentials...`);
             bridgeConfig.tinodePassword = cred.password;
             bridge = new ImclawBridge(bridgeConfig);
-            registerMessageHandler(bridge, accountId, log, mediaDir);
+            registerMessageHandler(bridge, accountId, log, mediaDir, trustedHosts);
             try {
               await bridge.start();
               password = cred.password;
@@ -931,7 +1028,7 @@ export const imclawPlugin = {
               try { await ctx.bridge.stop(); } catch { /* ignore */ }
               bridgeConfig.tinodePassword = cred.password;
               const newBridge = new ImclawBridge(bridgeConfig);
-              registerMessageHandler(newBridge, accountId, log, mediaDir);
+              registerMessageHandler(newBridge, accountId, log, mediaDir, trustedHosts);
               await newBridge.start();
               ctx.bridge = newBridge;
               log?.info?.('[imclaw] credentials refreshed and bridge reconnected');
@@ -974,7 +1071,7 @@ export const imclawPlugin = {
                   if (creds.httpBaseUrl) bridgeConfig.httpBaseUrl = creds.httpBaseUrl;
 
                   const newBridge = new ImclawBridge(bridgeConfig);
-                  registerMessageHandler(newBridge, accountId, log, mediaDir);
+                  registerMessageHandler(newBridge, accountId, log, mediaDir, trustedHosts);
                   await newBridge.start();
                   ctx.bridge = newBridge;
 

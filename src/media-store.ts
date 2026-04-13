@@ -15,6 +15,7 @@ export async function downloadMedia(
   originalName: string,
   seqId: number,
   customDir?: string,
+  trustedHosts?: string[],
 ): Promise<string | null> {
   try {
     // Validate URL to prevent SSRF — only allow http/https, block private IPs
@@ -22,9 +23,12 @@ export async function downloadMedia(
     try { parsed = new URL(url); } catch { return null; }
     if (!['http:', 'https:'].includes(parsed.protocol)) return null;
     const host = parsed.hostname;
-    if (host === 'localhost' || host.endsWith('.local') ||
-        /^(127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|0\.|169\.254\.)/.test(host) ||
-        host === '::1') {
+    // Allow downloads from trusted hosts (e.g. our own Tinode / IMClaw server)
+    const isTrusted = trustedHosts?.some(th => host === th || host.endsWith(`.${th}`));
+    if (!isTrusted && (
+      host === 'localhost' || host.endsWith('.local') ||
+      /^(127\.|10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|0\.|169\.254\.)/.test(host) ||
+      host === '::1')) {
       return null;
     }
 
