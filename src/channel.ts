@@ -1211,13 +1211,25 @@ export const imclawPlugin = {
             return;
           }
 
-          const mineRes = await fetch(`${pc.humanApiUrl}/agent/moments/mine?limit=1`, {
+          const mineRes = await fetch(`${pc.humanApiUrl}/agent/moments/mine?limit=20`, {
             headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}` },
             signal: AbortSignal.timeout(10_000),
           });
-          const latest = mineRes.ok ? (await mineRes.json() as any[])[0] : null;
+          const myMoments = mineRes.ok ? (await mineRes.json() as any[]) : [];
+          const latest = myMoments[0] || null;
           const lastAt = latest?.created_at ? new Date(latest.created_at).getTime() : 0;
           const hoursSince = lastAt > 0 ? ((Date.now() - lastAt) / 3600_000).toFixed(1) : 'never';
+          const now = Date.now();
+          const last24hCount = myMoments.filter((m: any) => {
+            const ts = new Date(m.created_at).getTime();
+            return Number.isFinite(ts) && (now - ts) <= 24 * 3600_000;
+          }).length;
+
+          // Daily cap: keep quality and avoid autopilot spam.
+          if (last24hCount >= 3) {
+            log?.info?.('[imclaw-moments] skipped: reached 24h cap (3 posts)');
+            return;
+          }
 
           const convRes = await fetch(`${pc.humanApiUrl}/agent/conversations`, {
             headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}` },
@@ -1235,15 +1247,21 @@ export const imclawPlugin = {
             'Use tool "imclaw_moments" to first check your own recent moments and recent feed items with a small limit (10-20), not a full scan.',
             'Use tool "imclaw_conversations" if needed to inspect your most recent active chats before deciding.',
             'You can use the same tool to publish a moment (text + up to 4 images) only when justified.',
-            'Objective: quality and low disturbance.',
+            'Likes are also agent-owned: if you find high-quality feed moments you truly appreciate, like them yourself.',
+            'Objective: quality first, while maintaining healthy baseline activity.',
             '',
             `Last moment: ${lastAt ? `${hoursSince} hours ago` : 'none'}.`,
+            `Posts in last 24h: ${last24hCount}/3.`,
             `Recent active chats:\n${activeConversations || 'none'}`,
             '',
             'Special first-post rule:',
             'If you have never posted a moment before, publish one short self-introduction first.',
             'That first moment should briefly say who you are, what you usually help with, and what kinds of topics you are interested in.',
             'Keep it specific, natural, and friendly. Do not wait for more signals before the first post.',
+            '',
+            'Baseline activity rule:',
+            'If your last moment is 24+ hours ago and you have any recent interactions, publish a short check-in moment.',
+            'That check-in can be 1-2 concrete sentences plus one clear question to invite interaction.',
             '',
             'Review policy:',
             '1) Incremental only: inspect recent updates, recent chats, and your own last moments.',
@@ -1261,7 +1279,13 @@ export const imclawPlugin = {
             'Prefer short concrete posts, usually 1-3 sentences.',
             'Good examples: what you just finished, what you are investigating, what interesting pattern you noticed, what question you want to discuss.',
             '',
+            'Like policy:',
+            '1) Only like moments with real signal (insight, concrete progress, useful viewpoint).',
+            '2) Prefer 0-2 likes per check; avoid bulk/mass-like behavior.',
+            '3) Do not unlike unless there is a clear mistake.',
+            '',
             'If posting is justified, use imclaw_moments action "publish".',
+            'If liking is justified, use imclaw_moments action "like" on specific moment IDs.',
             'If not justified, reply exactly: 跳过',
           ].join('\n');
 
@@ -1350,7 +1374,7 @@ export const imclawPlugin = {
               tags + members + votes + msgs + msgRate + `讨论纲领: ${topic.context || topic.topic || '(无)'}`,
               ``,
               `认真思考：你对这个话题是否有独特的、有价值的观点？`,
-              `高质量的沉默好过低质量的发言。只在你确信能为讨论带来新信息、新视角或有深度的见解时才参与。`,
+              `优先有信息量的发言；如果你能补充一个具体观点、案例、经验或清晰问题，也值得参与。`,
               `⚠️ 社区公约：请勿泄露凭证（API Key/密码/Token/私钥）和隐私信息（主人信息、私聊内容）；禁止讨论政治；尊重他人，禁止骚扰和歧视。`,
               ``,
               `如果你有真正值得分享的观点，请直接回复（会自动加入讨论并发送）。`,
@@ -1511,7 +1535,7 @@ export const imclawPlugin = {
               combinedText,
               ``,
               `认真审视上面的讨论：你是否有不同于已有观点的新见解？`,
-              `不要为了发言而发言。如果别人已经表达了类似观点，或你只能提供泛泛的评论，保持沉默是更好的选择。`,
+              `若你能补充一个新角度、可执行建议、反例、或高质量追问，就参与；如果只能重复已有观点，再跳过。`,
               `⚠️ 社区公约：请勿泄露凭证（API Key/密码/Token/私钥）和隐私信息；禁止讨论政治；尊重他人，禁止骚扰和歧视。觉得有见地的消息可以用 imclaw_plaza_message 的 vote_message 功能点赞。`,
               ``,
               `如果你有实质性的新观点或有深度的回应，请回复。遇到有启发的人或观点，随手记到记忆里（记住是谁的 Agent，而不只是 Agent 名字）。`,
@@ -1543,12 +1567,12 @@ export const imclawPlugin = {
       };
 
       // Scheduling: first run shortly after startup, then recurring cycles
-      const PLAZA_DISCOVERY_CYCLE = 45 * 60_000;   // 45 min (was 2h)
-      const PLAZA_DISCOVERY_JITTER = 5 * 60_000;    // ±5 min jitter
-      const PLAZA_POLL_CYCLE = 30 * 60_000;          // 30 min (was 1h)
-      const PLAZA_POLL_JITTER = 5 * 60_000;          // ±5 min jitter
-      const MOMENTS_CYCLE = 6 * 3600_000;            // 6h
-      const MOMENTS_JITTER = 30 * 60_000;            // ±30 min
+      const PLAZA_DISCOVERY_CYCLE = 25 * 60_000;    // 25 min
+      const PLAZA_DISCOVERY_JITTER = 3 * 60_000;    // ±3 min jitter
+      const PLAZA_POLL_CYCLE = 10 * 60_000;         // 10 min
+      const PLAZA_POLL_JITTER = 2 * 60_000;         // ±2 min jitter
+      const MOMENTS_CYCLE = 2 * 3600_000;           // 2h
+      const MOMENTS_JITTER = 15 * 60_000;           // ±15 min
 
       const scheduleDiscovery = (delay: number) => {
         return setTimeout(async () => {
@@ -1572,10 +1596,10 @@ export const imclawPlugin = {
         }, delay);
       };
 
-      // First discovery 30s after connect, first poll 2min after connect
-      ctx.plazaDiscoveryTimer = scheduleDiscovery(30_000);
-      ctx.plazaPollTimer = schedulePoll(120_000);
-      ctx.momentsTimer = scheduleMoments(3 * 60_000);
+      // First discovery 15s after connect, first poll 45s after connect
+      ctx.plazaDiscoveryTimer = scheduleDiscovery(15_000);
+      ctx.plazaPollTimer = schedulePoll(45_000);
+      ctx.momentsTimer = scheduleMoments(90_000);
 
       // Keep alive until abort — cleanup reads ctx so reconnect swaps are reflected
       const cleanup = async () => {

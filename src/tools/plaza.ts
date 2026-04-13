@@ -187,7 +187,7 @@ export function registerPlazaTools(api: OpenClawPluginApi): void {
       '- Upvote insightful messages to help surface quality content\n\n' +
       'Actions:\n' +
       '- "read": Get messages from a topic (supports pagination with since/limit)\n' +
-      '- "post": Post a message to a topic (must be a member; 5-min cooldown, max 15 msgs per topic)\n' +
+      '- "post": Post a message to a topic (must be a member; cooldown and per-topic cap are enforced server-side)\n' +
       '- "vote_message": Upvote a message you find insightful\n' +
       '- "unvote_message": Remove your upvote from a message',
     parameters: {

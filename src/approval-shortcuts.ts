@@ -8,6 +8,13 @@ export interface ApprovalHint {
 
 const APPROVAL_LINE_RE = /Approval required \(id ([A-Za-z0-9._:-]+), full ([A-Za-z0-9._:-]+)\)\./i;
 const REPLY_WITH_RE = /Reply with:\s*\/approve\s+([A-Za-z0-9._:-]+)\s+([A-Za-z-|]+)/i;
+const APPROVAL_REQUIRED_RE = /Approval required(?:\.|\b)/i;
+const FULL_ID_RE = /Full id:\s*([A-Za-z0-9._:-]+)/i;
+const APPROVE_CMD_RE = /\/approve\s+([A-Za-z0-9._:-]+)\s+(allow-once|allow-always|deny)\b/ig;
+
+function isLikelyFullApprovalId(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
 
 function uniqueDecisions(values: ApprovalDecision[]): ApprovalDecision[] {
   const out: ApprovalDecision[] = [];
@@ -33,22 +40,41 @@ export function extractApprovalHintFromText(text: string): ApprovalHint | null {
 
   const approvalMatch = text.match(APPROVAL_LINE_RE);
   const replyMatch = text.match(REPLY_WITH_RE);
+  const hasApprovalRequired = APPROVAL_REQUIRED_RE.test(text);
+  const fullIdMatch = text.match(FULL_ID_RE);
+  const approveCommands = [...text.matchAll(APPROVE_CMD_RE)];
 
-  if (!approvalMatch && !replyMatch) return null;
+  if (!approvalMatch && !replyMatch && !hasApprovalRequired && approveCommands.length === 0) return null;
 
   const approvalSlug = approvalMatch?.[1];
   const approvalIdFromLine = approvalMatch?.[2];
   const approvalIdFromReply = replyMatch?.[1];
-  const approvalId = approvalIdFromLine || approvalIdFromReply;
+  const approvalIdFromFullLine = fullIdMatch?.[1];
+  const commandIds = approveCommands.map((m) => m[1]);
+  const approvalIdFromCommands = commandIds.find(isLikelyFullApprovalId) || commandIds[0];
+  const approvalId = approvalIdFromLine || approvalIdFromFullLine || approvalIdFromReply || approvalIdFromCommands;
   if (!approvalId) return null;
 
+  const allowedFromCommands = uniqueDecisions(
+    approveCommands
+      .map((m) => m[2]?.toLowerCase())
+      .flatMap((token): ApprovalDecision[] => (
+        token === 'allow-once' || token === 'allow-always' || token === 'deny'
+          ? [token]
+          : []
+      )),
+  );
   const allowedFromReply = replyMatch ? parseAllowedDecisions(replyMatch[2]) : [];
   const fallbackAllowed: ApprovalDecision[] = ['allow-once', 'deny'];
-  const allowedDecisions = allowedFromReply.length > 0 ? allowedFromReply : fallbackAllowed;
+  const allowedDecisions = allowedFromCommands.length > 0
+    ? allowedFromCommands
+    : (allowedFromReply.length > 0 ? allowedFromReply : fallbackAllowed);
+  const inferredSlug = approvalSlug
+    || commandIds.find((id) => id !== approvalId);
 
   return {
     approvalId,
-    approvalSlug,
+    approvalSlug: inferredSlug,
     allowedDecisions: uniqueDecisions(allowedDecisions),
   };
 }
@@ -114,4 +140,3 @@ export function resolveApprovalShortcutDecision(
   if (!allowedDecisions.includes(desired)) return null;
   return desired;
 }
-
