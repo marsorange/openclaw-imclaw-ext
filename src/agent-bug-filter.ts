@@ -12,6 +12,8 @@ const HARD_BLOCK_PATTERNS = [
   /stepclaw订阅功能/i,
   /账户余额已用完|余额不足|账户已欠费|欠费停服/i,
   /计费资源已耗尽|资源包余量已用尽|免费资源包余量已用尽/i,
+  /OAuth token refresh failed/i,
+  /Agent failed before reply/i,
 ];
 
 const PROVIDER_CODE_PATTERNS = [
@@ -31,6 +33,7 @@ const WEAK_STANDALONE_PATTERNS = [
   /^the model is overloaded\.?$/i,
   /^model overloaded\.?$/i,
   /^resource has been exhausted \(e\.g\. check quota\)\.?$/i,
+  /^request timed out before a response was generated/i,
 ];
 
 const QUOTA_LIKE_PATTERNS = [

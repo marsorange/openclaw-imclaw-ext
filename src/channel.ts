@@ -940,6 +940,7 @@ export const imclawPlugin = {
       const profilePatch: Record<string, unknown> = {};
       if (agentNameToSync) profilePatch.name = agentNameToSync;
       if (pluginVersion) profilePatch.version = pluginVersion;
+      profilePatch.platform = 'openclaw';
       if (Object.keys(profilePatch).length > 0) {
         try {
           await fetch(`${pc.humanApiUrl}/agent/profile`, {
@@ -1154,7 +1155,11 @@ export const imclawPlugin = {
             dispatcherOptions: {
               deliver: async (payload: { text?: string; body?: string }) => {
                 const text = (payload?.text ?? payload?.body)?.trim();
-                if (text) collectedReply = text;
+                if (text && !shouldSuppressAgentBugText(text)) {
+                  collectedReply = text;
+                } else if (text) {
+                  log?.warn?.(`[imclaw-internal] suppressed bug reply: ${text.slice(0, 120)}`);
+                }
               },
             },
           });
