@@ -287,8 +287,13 @@ export class TinodeClient extends EventEmitter {
     if (msg.meta && msg.meta.sub) {
       console.log(`[tinode] {meta} sub count=${msg.meta.sub.length}`);
       for (const sub of msg.meta.sub) {
+        console.log(`[tinode] {meta} topic=${sub.topic} with=${sub.with} user=${sub.user}`);
         if (sub.topic && !this.subscribedTopics.has(sub.topic)) {
-          this.subscribeTopic(sub.topic).catch(() => {});
+          this.subscribeTopic(sub.topic).then(() => {
+            console.log(`[tinode] subscribed to ${sub.topic} (resolved: ${this.resolvedTopics.get(sub.topic) || sub.topic})`);
+          }).catch((err) => {
+            console.error(`[tinode] subscribe FAILED for ${sub.topic}: ${err.message}`);
+          });
         }
         // Build user → p2p topic mapping from "me" subscriptions
         // Tinode uses "with" field for the other user in p2p topics
@@ -305,6 +310,7 @@ export class TinodeClient extends EventEmitter {
 
     // Handle incoming {data} messages
     if (msg.data) {
+      console.log(`[tinode] {data} topic=${msg.data.topic} from=${msg.data.from} seq=${msg.data.seq}`);
       // Track user → p2p topic mapping from incoming messages
       if (msg.data.topic?.startsWith('p2p') && msg.data.from) {
         this.resolvedTopics.set(msg.data.from, msg.data.topic);

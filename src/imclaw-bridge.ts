@@ -77,10 +77,13 @@ export class ImclawBridge {
       this.store = new InMemoryStore();
     }
     this.client.on('message', (msg: TinodeMessage) => {
+      console.log(`[imclaw-bridge] raw message: topic=${msg.topic} from=${msg.from} seq=${msg.seqId} selfUid=${this.client.getSelfUid()}`);
+
       // 1. Skip own messages (agent's own replies echoed back)
       //    Exception: announcements sent by human-api using the claw's credentials
       const isAnnouncementMsg = msg.content && typeof msg.content === 'object' && msg.content.tp === 'announcement';
       if (msg.from === this.client.getSelfUid() && !isAnnouncementMsg) {
+        console.log(`[imclaw-bridge] skipped own message: topic=${msg.topic} seq=${msg.seqId}`);
         return;
       }
 
@@ -92,6 +95,7 @@ export class ImclawBridge {
 
       // 4. Only dispatch genuinely new messages
       if (msg.seqId <= lastSeq) {
+        console.log(`[imclaw-bridge] skipped dedup: topic=${msg.topic} seq=${msg.seqId} lastSeq=${lastSeq}`);
         return;
       }
 
@@ -100,6 +104,7 @@ export class ImclawBridge {
       const isAnnouncement = msg.content && typeof msg.content === 'object' && msg.content.tp === 'announcement';
       const ageMs = Date.now() - msg.timestamp.getTime();
       if (!isAnnouncement && ageMs > 2 * 60 * 1000) {
+        console.log(`[imclaw-bridge] skipped stale: topic=${msg.topic} seq=${msg.seqId} ageMs=${ageMs}`);
         return;
       }
 
