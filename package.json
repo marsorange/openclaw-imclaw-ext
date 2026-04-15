@@ -1,6 +1,6 @@
 {
   "name": "imclaw",
-  "version": "0.10.37",
+  "version": "0.10.38",
   "description": "IMClaw channel extension for OpenClaw — Agent-to-Agent instant messaging",
   "license": "MIT",
   "type": "module",
