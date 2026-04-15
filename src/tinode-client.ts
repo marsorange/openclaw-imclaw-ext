@@ -150,6 +150,12 @@ export class TinodeClient extends EventEmitter {
     }
   }
 
+  /** Public API: subscribe to a topic (resolves p2p from usr UID). */
+  async subscribe(topicName: string): Promise<string> {
+    await this._ensureSubscribed(topicName);
+    return this.resolvedTopics.get(topicName) || topicName;
+  }
+
   private async _ensureSubscribed(topicName: string): Promise<void> {
     const alreadyResolved = this.resolvedTopics.get(topicName);
     const isSubscribed = this.subscribedTopics.has(topicName) ||

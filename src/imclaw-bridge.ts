@@ -168,6 +168,17 @@ export class ImclawBridge {
     console.log('IMClaw: connected to Tinode');
   }
 
+  /**
+   * Subscribe to a peer's p2p topic. Pass a usr UID — Tinode resolves to p2p topic.
+   * Returns the resolved topic name (e.g. p2pXXX).
+   */
+  async subscribeToPeer(peerUid: string): Promise<string> {
+    const topic = peerUid.startsWith('usr') ? peerUid : `usr${peerUid}`;
+    const resolved = await this.client.subscribe(topic);
+    console.log(`[imclaw-bridge] subscribeToPeer: ${topic} → ${resolved}`);
+    return resolved;
+  }
+
   async sendMessage(topicName: string, content: any): Promise<number> {
     return this.client.sendMessage(topicName, content);
   }

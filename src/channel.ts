@@ -929,6 +929,13 @@ export const imclawPlugin = {
           if (owner.tinode_uid) {
             ctx.ownerTinodeUid = owner.tinode_uid;
             log?.info?.(`[imclaw] owner UID cached: ${owner.tinode_uid}`);
+            // Subscribe to owner's p2p topic so agent can receive messages from the owner
+            try {
+              const resolved = await bridge.subscribeToPeer(owner.tinode_uid);
+              log?.info?.(`[imclaw] subscribed to owner p2p topic: ${resolved}`);
+            } catch (err: any) {
+              log?.warn?.(`[imclaw] failed to subscribe to owner p2p topic: ${err.message}`);
+            }
           }
         }
       } catch {
