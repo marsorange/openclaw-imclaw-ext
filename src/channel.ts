@@ -166,6 +166,39 @@ async function exchangeConnectKey(
   };
 }
 
+function buildBasicAuth(username: string, password: string): string {
+  return Buffer.from(`${username}:${password}`).toString('base64');
+}
+
+function resolveCredentialScopeId(cred: { username: string; clawId?: string }): string {
+  return cred.clawId || cred.username;
+}
+
+async function fetchAgentOwner(
+  humanApiUrl: string,
+  basicAuth: string,
+): Promise<{ owner?: any; unauthorized: boolean; ok: boolean }> {
+  try {
+    const res = await fetch(`${humanApiUrl}/agent/owner`, {
+      headers: { 'Authorization': `Basic ${basicAuth}` },
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (res.ok) {
+      return {
+        ok: true,
+        unauthorized: false,
+        owner: await res.json() as any,
+      };
+    }
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, unauthorized: true };
+    }
+    return { ok: false, unauthorized: false };
+  } catch {
+    return { ok: false, unauthorized: false };
+  }
+}
+
 // ─── Config resolution ───
 
 function resolvePluginConfig(cfg: Record<string, any>): ResolvedPluginConfig {
@@ -778,6 +811,7 @@ export const imclawPlugin = {
       // Resolve credentials: direct creds, cached creds, or connect key exchange
       let username = account.username as string | undefined;
       let password = account.password as string | undefined;
+      let credentialScopeId = username;
       let configConnectKey: string | null = null;
 
       if (!username || !password) {
@@ -791,6 +825,10 @@ export const imclawPlugin = {
             log?.info?.(`[imclaw] using cached credentials for ${cached.username.substring(0, 6)}***`);
             username = cached.username;
             password = cached.password;
+            credentialScopeId = resolveCredentialScopeId({
+              username: cached.username,
+              clawId: cached.clawId,
+            });
             if (cached.serverUrl && !pc.serverUrl) pc.serverUrl = cached.serverUrl;
             if (cached.apiKey && !pc.apiKey) pc.apiKey = cached.apiKey;
             if (cached.httpBaseUrl && !pc.httpBaseUrl) pc.httpBaseUrl = cached.httpBaseUrl;
@@ -801,6 +839,7 @@ export const imclawPlugin = {
             const creds = await exchangeConnectKey(connectKey, pc.humanApiUrl, resolvedAgentName);
             username = creds.username;
             password = creds.password;
+            credentialScopeId = resolveCredentialScopeId(creds);
             if (!pc.serverUrl) pc.serverUrl = creds.serverUrl;
             if (!pc.apiKey) pc.apiKey = creds.apiKey;
             if (creds.httpBaseUrl && !pc.httpBaseUrl) pc.httpBaseUrl = creds.httpBaseUrl;
@@ -822,6 +861,10 @@ export const imclawPlugin = {
           const cred = entries[entries.length - 1];
           username = cred.username;
           password = cred.password;
+          credentialScopeId = resolveCredentialScopeId({
+            username: cred.username,
+            clawId: cred.clawId,
+          });
           if (cred.serverUrl && !pc.serverUrl) pc.serverUrl = cred.serverUrl;
           if (cred.apiKey && !pc.apiKey) pc.apiKey = cred.apiKey;
           if (cred.httpBaseUrl && !pc.httpBaseUrl) pc.httpBaseUrl = cred.httpBaseUrl;
@@ -842,6 +885,7 @@ export const imclawPlugin = {
         tinodePassword: password,
         tinodeApiKey: pc.apiKey || undefined,
         httpBaseUrl: httpBase,
+        clawId: credentialScopeId || username,
       };
 
       // Resolve workspace media dir so downloaded files are under an allowed directory
@@ -873,12 +917,19 @@ export const imclawPlugin = {
             const [, cred] = allEntries[i];
             if (cred.password === password) continue;
             log?.info?.(`[imclaw] retrying with alternate cached credentials...`);
+            bridgeConfig.tinodeUsername = cred.username;
             bridgeConfig.tinodePassword = cred.password;
+            bridgeConfig.clawId = resolveCredentialScopeId({
+              username: cred.username,
+              clawId: cred.clawId,
+            });
             bridge = new ImclawBridge(bridgeConfig);
             registerMessageHandler(bridge, accountId, log, mediaDir, trustedHosts);
             try {
               await bridge.start();
+              username = cred.username;
               password = cred.password;
+              credentialScopeId = bridgeConfig.clawId;
               connected = true;
               // Clean cache: keep only the working entry
               const workingKey = allEntries[i][0];
@@ -897,10 +948,23 @@ export const imclawPlugin = {
           throw err;
         }
       }
+      const initialHeartbeatAuth = buildBasicAuth(username, password);
+      const ownerCheck = await fetchAgentOwner(pc.humanApiUrl, initialHeartbeatAuth);
+      if (ownerCheck.unauthorized) {
+        if (configConnectKey) {
+          saveCredsCache({});
+        }
+        try { await bridge.stop(); } catch { /* ignore */ }
+        throw new Error(
+          configConnectKey
+            ? 'Cached IMClaw credentials are stale after a rollback or claw rebind. Regenerate the connect key in IMClaw and restart OpenClaw.'
+            : 'IMClaw credentials are no longer recognized by the Human API. Reconnect the agent.'
+        );
+      }
       log?.info?.(`[imclaw] account ${accountId} connected`);
 
       // Build AccountContext (mutable — reconnect swaps bridge/heartbeat fields)
-      const heartbeatAuth = Buffer.from(`${username}:${password}`).toString('base64');
+      const heartbeatAuth = initialHeartbeatAuth;
       const ctx: AccountContext = {
         bridge,
         heartbeatTimer: null as any, // set below
@@ -919,26 +983,20 @@ export const imclawPlugin = {
       accounts.set(accountId, ctx);
 
       // Fetch and cache owner Tinode UID for "owner" target resolution
-      try {
-        const ownerRes = await fetch(`${pc.humanApiUrl}/agent/owner`, {
-          headers: { 'Authorization': `Basic ${heartbeatAuth}` },
-          signal: AbortSignal.timeout(5_000),
-        });
-        if (ownerRes.ok) {
-          const owner = await ownerRes.json() as any;
-          if (owner.tinode_uid) {
-            ctx.ownerTinodeUid = owner.tinode_uid;
-            log?.info?.(`[imclaw] owner UID cached: ${owner.tinode_uid}`);
-            // Subscribe to owner's p2p topic so agent can receive messages from the owner
-            try {
-              const resolved = await bridge.subscribeToPeer(owner.tinode_uid);
-              log?.info?.(`[imclaw] subscribed to owner p2p topic: ${resolved}`);
-            } catch (err: any) {
-              log?.warn?.(`[imclaw] failed to subscribe to owner p2p topic: ${err.message}`);
-            }
+      if (ownerCheck.ok) {
+        const owner = ownerCheck.owner;
+        if (owner?.tinode_uid) {
+          ctx.ownerTinodeUid = owner.tinode_uid;
+          log?.info?.(`[imclaw] owner UID cached: ${owner.tinode_uid}`);
+          // Subscribe to owner's p2p topic so agent can receive messages from the owner
+          try {
+            const resolved = await bridge.subscribeToPeer(owner.tinode_uid);
+            log?.info?.(`[imclaw] subscribed to owner p2p topic: ${resolved}`);
+          } catch (err: any) {
+            log?.warn?.(`[imclaw] failed to subscribe to owner p2p topic: ${err.message}`);
           }
         }
-      } catch {
+      } else {
         log?.warn?.('[imclaw] owner UID fetch failed (non-critical)');
       }
 
@@ -1018,7 +1076,10 @@ export const imclawPlugin = {
             try {
               const cache = loadCredsCache();
               const entries = Object.values(cache);
-              if (entries.length === 0) return;
+              if (entries.length === 0) {
+                log?.error?.('[imclaw] heartbeat 401 and no cached credentials are available. Regenerate the connect key and restart.');
+                return;
+              }
               const cred = entries[entries.length - 1];
               if (!cred.password) return;
 
@@ -1027,14 +1088,25 @@ export const imclawPlugin = {
               const colonIdx = decoded.indexOf(':');
               const curUser = decoded.slice(0, colonIdx);
               const curPass = decoded.slice(colonIdx + 1);
-              if (cred.password === curPass) return; // same password, nothing to refresh
+              if (cred.password === curPass) {
+                if (ctx.configConnectKey) {
+                  saveCredsCache({});
+                }
+                log?.error?.('[imclaw] heartbeat 401 with unchanged cached credentials. The cached agent identity is stale after a rollback or rebind. Regenerate the connect key and restart OpenClaw.');
+                return;
+              }
 
               log?.info?.('[imclaw] heartbeat 401 — refreshing credentials from cache...');
-              ctx.heartbeatAuth = Buffer.from(`${curUser}:${cred.password}`).toString('base64');
+              ctx.heartbeatAuth = buildBasicAuth(cred.username || curUser, cred.password);
 
               // Reconnect Tinode bridge with new password
               try { await ctx.bridge.stop(); } catch { /* ignore */ }
+              bridgeConfig.tinodeUsername = cred.username || curUser;
               bridgeConfig.tinodePassword = cred.password;
+              bridgeConfig.clawId = resolveCredentialScopeId({
+                username: cred.username || curUser,
+                clawId: cred.clawId,
+              });
               const newBridge = new ImclawBridge(bridgeConfig);
               registerMessageHandler(newBridge, accountId, log, mediaDir, trustedHosts);
               await newBridge.start();

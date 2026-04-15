@@ -63,7 +63,14 @@ export class MessageStore {
     this.db.exec(`CREATE INDEX IF NOT EXISTS idx_messages_owner ON messages(owner_claw_id, topic)`);
   }
 
+  private scopedTopic(topic: string, ownerClawId?: string): string {
+    // Rebound/recreated claws can reuse the same peer topic names with a fresh seq space.
+    // Scope local dedup state by claw identity so an old account cannot suppress new messages.
+    return ownerClawId ? `${ownerClawId}::${topic}` : topic;
+  }
+
   saveMessage(topic: string, fromUser: string, seqId: number, content: any, timestamp: Date, ownerClawId?: string): void {
+    const scopedTopic = this.scopedTopic(topic, ownerClawId);
     const contentStr = typeof content === 'string' ? content : JSON.stringify(content);
     // Wrap in transaction for atomicity and better SQLite performance
     this.db.exec('BEGIN');
@@ -71,12 +78,12 @@ export class MessageStore {
       this.db.run(
         `INSERT OR IGNORE INTO messages (topic, from_user, seq_id, content, timestamp, owner_claw_id)
          VALUES (?, ?, ?, ?, ?, ?)`,
-        [topic, fromUser, seqId, contentStr, timestamp.toISOString(), ownerClawId || null]
+        [scopedTopic, fromUser, seqId, contentStr, timestamp.toISOString(), ownerClawId || null]
       );
       this.db.run(
         `INSERT INTO sync_state (topic, last_seq) VALUES (?, ?)
          ON CONFLICT(topic) DO UPDATE SET last_seq = MAX(last_seq, excluded.last_seq)`,
-        [topic, seqId]
+        [scopedTopic, seqId]
       );
       this.db.exec('COMMIT');
     } catch (err) {
@@ -85,10 +92,10 @@ export class MessageStore {
     }
   }
 
-  getLastSeq(topic: string): number {
+  getLastSeq(topic: string, ownerClawId?: string): number {
     const row = this.db.get(
       'SELECT last_seq FROM sync_state WHERE topic = ?',
-      [topic]
+      [this.scopedTopic(topic, ownerClawId)]
     ) as unknown as { last_seq: number } | null;
     return row?.last_seq || 0;
   }

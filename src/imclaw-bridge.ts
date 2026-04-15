@@ -4,9 +4,14 @@ import { MessageStore } from './message-store.js';
 /** Minimal in-memory fallback when SQLite is unavailable */
 class InMemoryStore {
   private seqs = new Map<string, number>();
-  getLastSeq(topic: string): number { return this.seqs.get(topic) ?? 0; }
+  private scopedTopic(topic: string, ownerClawId?: string): string {
+    return ownerClawId ? `${ownerClawId}::${topic}` : topic;
+  }
+  getLastSeq(topic: string, ownerClawId?: string): number {
+    return this.seqs.get(this.scopedTopic(topic, ownerClawId)) ?? 0;
+  }
   saveMessage(_topic: string, _from: string, seqId: number, _content: any, _ts: Date, _owner?: string): void {
-    const topic = _topic;
+    const topic = this.scopedTopic(_topic, _owner);
     const cur = this.seqs.get(topic) ?? 0;
     if (seqId > cur) this.seqs.set(topic, seqId);
   }
@@ -88,7 +93,7 @@ export class ImclawBridge {
       }
 
       // 2. Check last known seq for dedup
-      const lastSeq = this.store.getLastSeq(msg.topic);
+      const lastSeq = this.store.getLastSeq(msg.topic, config.clawId);
 
       // 3. Persist locally (INSERT OR IGNORE — idempotent)
       this.store.saveMessage(msg.topic, msg.from, msg.seqId, msg.content, msg.timestamp, config.clawId);
