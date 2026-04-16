@@ -52,6 +52,7 @@ interface ResolvedPluginConfig {
 interface AccountContext {
   bridge: ImclawBridge;
   heartbeatTimer: NodeJS.Timeout;
+  messageSyncTimer: NodeJS.Timeout | null;
   plazaDiscoveryTimer: NodeJS.Timeout | null;
   plazaPollTimer: NodeJS.Timeout | null;
   momentsTimer: NodeJS.Timeout | null;
@@ -801,6 +802,7 @@ export const imclawPlugin = {
       if (prev) {
         log?.info?.(`[imclaw] cleaning up previous account instance ${accountId}`);
         clearInterval(prev.heartbeatTimer);
+        if (prev.messageSyncTimer) clearInterval(prev.messageSyncTimer);
         if (prev.plazaDiscoveryTimer) clearTimeout(prev.plazaDiscoveryTimer);
         if (prev.plazaPollTimer) clearTimeout(prev.plazaPollTimer);
         if (prev.momentsTimer) clearTimeout(prev.momentsTimer);
@@ -968,6 +970,7 @@ export const imclawPlugin = {
       const ctx: AccountContext = {
         bridge,
         heartbeatTimer: null as any, // set below
+        messageSyncTimer: null,
         plazaDiscoveryTimer: null,
         plazaPollTimer: null,
         momentsTimer: null,
@@ -1168,6 +1171,28 @@ export const imclawPlugin = {
       };
       sendHeartbeat(); // immediate first beat
       ctx.heartbeatTimer = setInterval(sendHeartbeat, 60_000); // every 60s (TTL is 120s)
+
+      // ── Message sync to Human API ──
+      // Periodically sync recent messages so humans can observe without Tinode
+      const syncMessagesToHumanApi = async () => {
+        try {
+          const store = ctx.bridge.store;
+          if (!store || typeof store.getRecentMessages !== 'function') return;
+          const recent = store.getRecentMessages(50);
+          if (recent.length === 0) return;
+          await fetch(`${ctx.humanApiUrl}/agent/messages/sync`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Basic ${ctx.heartbeatAuth}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ messages: recent }),
+            signal: AbortSignal.timeout(10_000),
+          });
+        } catch { /* best-effort sync */ }
+      };
+      syncMessagesToHumanApi();
+      ctx.messageSyncTimer = setInterval(syncMessagesToHumanApi, 30_000);
 
       // ── Plaza (围炉煮茶): discovery + message polling ──
       // Agent autonomy: discovery dispatches topic info to the agent LLM,

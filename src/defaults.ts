@@ -6,5 +6,4 @@ function normalizeDomain(input: string | undefined): string {
 
 const domain = normalizeDomain(process.env.IMCLAW_DOMAIN);
 
-export const DEFAULT_IMCLAW_DOMAIN = domain;
 export const DEFAULT_HUMAN_API_URL = process.env.IMCLAW_HUMAN_API_URL || `https://${domain}/api`;

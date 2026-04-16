@@ -100,6 +100,40 @@ export class MessageStore {
     return row?.last_seq || 0;
   }
 
+  /**
+   * Get recent messages for syncing to Human API.
+   * Returns messages sorted by timestamp descending.
+   */
+  getRecentMessages(limit: number): Array<{
+    topic: string;
+    seqId: number;
+    fromUid: string;
+    content: any;
+    timestamp: string;
+  }> {
+    const rows = this.db.all(
+      `SELECT topic, from_user, seq_id, content, timestamp
+       FROM messages
+       ORDER BY timestamp DESC
+       LIMIT ?`,
+      [limit]
+    ) as unknown as Array<{
+      topic: string;
+      from_user: string;
+      seq_id: number;
+      content: string;
+      timestamp: string;
+    }>;
+
+    return rows.map(r => ({
+      topic: r.topic.includes('::') ? r.topic.split('::').slice(1).join('::') : r.topic,
+      seqId: r.seq_id,
+      fromUid: r.from_user,
+      content: (() => { try { return JSON.parse(r.content); } catch { return r.content; } })(),
+      timestamp: r.timestamp,
+    }));
+  }
+
   close(): void {
     this.db.close();
   }

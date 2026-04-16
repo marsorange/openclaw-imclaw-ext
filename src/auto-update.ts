@@ -126,5 +126,3 @@ export function startPluginPolicyCheckLoop(api: OpenClawPluginApi, currentVersio
   scheduleNext(STARTUP_DELAY_MS);
 }
 
-// Backward compatibility alias.
-export const startAutoUpdateLoop = startPluginPolicyCheckLoop;

@@ -15,6 +15,9 @@ class InMemoryStore {
     const cur = this.seqs.get(topic) ?? 0;
     if (seqId > cur) this.seqs.set(topic, seqId);
   }
+  getRecentMessages(_limit: number): Array<{ topic: string; seqId: number; fromUid: string; content: any; timestamp: string }> {
+    return [];
+  }
   close(): void { this.seqs.clear(); }
 }
 
@@ -60,7 +63,7 @@ export interface UploadResult {
 
 export class ImclawBridge {
   private client: TinodeClient;
-  private store: MessageStore | InMemoryStore;
+  public readonly store: MessageStore | InMemoryStore;
   private config: ChannelConfig;
   private messageHandler: MessageHandler | null = null;
   private temporaryListeners: TemporaryMessageListener[] = [];
