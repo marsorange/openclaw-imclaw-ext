@@ -1,4 +1,3 @@
-import WebSocket from 'ws';
 import { EventEmitter } from 'events';
 
 export interface TinodeMessage {
@@ -18,7 +17,8 @@ export interface TinodeClientOptions {
 }
 
 export class TinodeClient extends EventEmitter {
-  private ws: WebSocket | null = null;
+  private ws: globalThis.WebSocket | null = null;
+  private wsAbortController: AbortController | null = null;
   private options: TinodeClientOptions;
   private msgId = 0;
   private reconnectDelay = 1000;
@@ -44,9 +44,10 @@ export class TinodeClient extends EventEmitter {
     this.options = options;
   }
 
-  private safeParse(data: WebSocket.Data): any | null {
+  private safeParse(data: string | ArrayBuffer): any | null {
     try {
-      return JSON.parse(data.toString());
+      const text = typeof data === 'string' ? data : new TextDecoder().decode(data);
+      return JSON.parse(text);
     } catch {
       return null;
     }
@@ -69,10 +70,9 @@ export class TinodeClient extends EventEmitter {
       this.shouldReconnect = true;
 
       // Close previous WebSocket if any, to prevent duplicate connections
-      if (this.ws) {
-        try { this.ws.removeAllListeners(); this.ws.close(); } catch { /* ignore */ }
-        this.ws = null;
-      }
+      this.wsAbortController?.abort();
+      try { this.ws?.close(); } catch { /* ignore */ }
+      this.ws = null;
 
       let url = this.options.serverUrl;
 
@@ -86,6 +86,9 @@ export class TinodeClient extends EventEmitter {
         const sep = url.includes('?') ? '&' : '?';
         url = `${url}${sep}apikey=${this.options.apiKey}`;
       }
+
+      this.wsAbortController = new AbortController();
+      const { signal } = this.wsAbortController;
       this.ws = new WebSocket(url);
 
       const timeout = setTimeout(() => {
@@ -93,34 +96,35 @@ export class TinodeClient extends EventEmitter {
         reject(new Error('Connection timeout'));
       }, 10000);
 
-      this.ws.on('open', () => {
+      this.ws.addEventListener('open', () => {
         this.sendHi();
-      });
+      }, { signal });
 
-      this.ws.on('message', (data) => {
-        const msg = this.safeParse(data);
+      this.ws.addEventListener('message', (event: MessageEvent) => {
+        const msg = this.safeParse(event.data);
         if (!msg) return;
         this.handleMessage(msg, resolve, reject, timeout);
-      });
+      }, { signal });
 
-      this.ws.on('close', () => {
+      this.ws.addEventListener('close', () => {
         clearTimeout(timeout);
         this.stopHeartbeat();
         this.emit('disconnected');
         if (this.shouldReconnect) {
           this.scheduleReconnect();
         }
-      });
+      }, { signal });
 
-      this.ws.on('error', (err) => {
-        this.emit('error', err);
-      });
+      this.ws.addEventListener('error', () => {
+        this.emit('error', new Error('WebSocket connection error'));
+      }, { signal });
     });
   }
 
   disconnect(): void {
     this.shouldReconnect = false;
     this.stopHeartbeat();
+    this.wsAbortController?.abort();
     this.ws?.close();
     this.ws = null;
   }
@@ -168,12 +172,12 @@ export class TinodeClient extends EventEmitter {
   private _doPublish(topic: string, content: any): Promise<number> {
     const id = String(++this.msgId);
     return new Promise((resolve, reject) => {
-      const handler = (data: WebSocket.Data) => {
-        const msg = this.safeParse(data);
+      const handler = (event: MessageEvent) => {
+        const msg = this.safeParse(event.data);
         if (!msg) return;
         if (msg.ctrl && msg.ctrl.id === id) {
           clearTimeout(timeout);
-          this.ws?.off('message', handler);
+          this.ws?.removeEventListener('message', handler);
           if (msg.ctrl.code >= 200 && msg.ctrl.code < 300) {
             resolve(msg.ctrl.params?.seq || 0);
           } else {
@@ -182,11 +186,11 @@ export class TinodeClient extends EventEmitter {
         }
       };
       const timeout = setTimeout(() => {
-        this.ws?.off('message', handler);
+        this.ws?.removeEventListener('message', handler);
         reject(new Error('Send timeout'));
       }, 10000);
 
-      this.ws?.on('message', handler);
+      this.ws?.addEventListener('message', handler);
       this.send({
         pub: {
           id,
@@ -216,12 +220,12 @@ export class TinodeClient extends EventEmitter {
     const id = String(++this.msgId);
 
     return new Promise((resolve, reject) => {
-      const handler = (data: WebSocket.Data) => {
-        const msg = this.safeParse(data);
+      const handler = (event: MessageEvent) => {
+        const msg = this.safeParse(event.data);
         if (!msg) return;
         if (msg.ctrl && msg.ctrl.id === id) {
           clearTimeout(timeout);
-          this.ws?.off('message', handler);
+          this.ws?.removeEventListener('message', handler);
           if (msg.ctrl.code >= 200 && msg.ctrl.code < 400) {
             // 2xx = success, 3xx (304 = already subscribed) = also fine
             const resolvedTopic = msg.ctrl.topic || topicName;
@@ -239,11 +243,11 @@ export class TinodeClient extends EventEmitter {
       };
 
       const timeout = setTimeout(() => {
-        this.ws?.off('message', handler);
+        this.ws?.removeEventListener('message', handler);
         reject(new Error('Subscribe timeout'));
       }, 10000);
 
-      this.ws?.on('message', handler);
+      this.ws?.addEventListener('message', handler);
       const dataLimit = this.topicLimits.get(topicName) || 24;
       this.send({
         sub: {
@@ -373,7 +377,7 @@ export class TinodeClient extends EventEmitter {
 
   private send(msg: any): void {
     try {
-      if (this.ws?.readyState === WebSocket.OPEN) {
+      if (this.ws?.readyState === globalThis.WebSocket.OPEN) {
         this.ws.send(JSON.stringify(msg));
       }
     } catch { /* ignore send errors on closing socket */ }

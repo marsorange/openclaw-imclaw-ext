@@ -1,8 +1,7 @@
 import { TinodeClient, TinodeMessage, TinodeClientOptions } from './tinode-client.js';
-import { MessageStore } from './message-store.js';
 
-/** Minimal in-memory fallback when SQLite is unavailable */
-class InMemoryStore {
+/** In-memory dedup store — tracks last seq per topic for duplicate detection */
+class MessageDedup {
   private seqs = new Map<string, number>();
   private scopedTopic(topic: string, ownerClawId?: string): string {
     return ownerClawId ? `${ownerClawId}::${topic}` : topic;
@@ -10,15 +9,11 @@ class InMemoryStore {
   getLastSeq(topic: string, ownerClawId?: string): number {
     return this.seqs.get(this.scopedTopic(topic, ownerClawId)) ?? 0;
   }
-  saveMessage(_topic: string, _from: string, seqId: number, _content: any, _ts: Date, _owner?: string): void {
-    const topic = this.scopedTopic(_topic, _owner);
-    const cur = this.seqs.get(topic) ?? 0;
-    if (seqId > cur) this.seqs.set(topic, seqId);
+  updateSeq(topic: string, seqId: number, ownerClawId?: string): void {
+    const key = this.scopedTopic(topic, ownerClawId);
+    const cur = this.seqs.get(key) ?? 0;
+    if (seqId > cur) this.seqs.set(key, seqId);
   }
-  getRecentMessages(_limit: number): Array<{ topic: string; seqId: number; fromUid: string; content: any; timestamp: string }> {
-    return [];
-  }
-  close(): void { this.seqs.clear(); }
 }
 
 export interface ChannelConfig {
@@ -26,7 +21,6 @@ export interface ChannelConfig {
   tinodeUsername: string;
   tinodePassword: string;
   tinodeApiKey?: string;
-  dbPath?: string;
   httpBaseUrl?: string;  // HTTP base URL for file uploads (e.g. "http://localhost:6210")
   clawId?: string;       // Claw identifier for message ownership isolation
 }
@@ -63,13 +57,14 @@ export interface UploadResult {
 
 export class ImclawBridge {
   private client: TinodeClient;
-  public readonly store: MessageStore | InMemoryStore;
+  private readonly dedup: MessageDedup;
   private config: ChannelConfig;
   private messageHandler: MessageHandler | null = null;
   private temporaryListeners: TemporaryMessageListener[] = [];
 
   constructor(config: ChannelConfig) {
     this.config = config;
+    this.dedup = new MessageDedup();
     const clientOptions: TinodeClientOptions = {
       serverUrl: config.tinodeServerUrl,
       username: config.tinodeUsername,
@@ -78,12 +73,6 @@ export class ImclawBridge {
     };
 
     this.client = new TinodeClient(clientOptions);
-    try {
-      this.store = new MessageStore(config.dbPath);
-    } catch {
-      // SQLite unavailable — fall back to in-memory dedup
-      this.store = new InMemoryStore();
-    }
     this.client.on('message', (msg: TinodeMessage) => {
       console.log(`[imclaw-bridge] raw message: topic=${msg.topic} from=${msg.from} seq=${msg.seqId} selfUid=${this.client.getSelfUid()}`);
 
@@ -96,10 +85,10 @@ export class ImclawBridge {
       }
 
       // 2. Check last known seq for dedup
-      const lastSeq = this.store.getLastSeq(msg.topic, config.clawId);
+      const lastSeq = this.dedup.getLastSeq(msg.topic, config.clawId);
 
-      // 3. Persist locally (INSERT OR IGNORE — idempotent)
-      this.store.saveMessage(msg.topic, msg.from, msg.seqId, msg.content, msg.timestamp, config.clawId);
+      // 3. Update dedup tracker
+      this.dedup.updateSeq(msg.topic, msg.seqId, config.clawId);
 
       // 4. Only dispatch genuinely new messages
       if (msg.seqId <= lastSeq) {
@@ -263,6 +252,5 @@ export class ImclawBridge {
 
   async stop(): Promise<void> {
     this.client.disconnect();
-    this.store.close();
   }
 }
