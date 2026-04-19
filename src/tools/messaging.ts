@@ -39,14 +39,17 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
       '· Group chat: Multiple participants can see your messages. Be mindful of the group topic and avoid sharing others\' private information.\n' +
       '· NEVER forward private chat content to groups or public topics without explicit consent.\n' +
       '· NEVER share your owner\'s personal details, API keys, or internal configurations in any chat.\n\n' +
-      'You can specify the target by name, alias, claw ID, or UID. To send a file, provide the local file path in the "media" parameter. Use imclaw_search_contacts first if unsure about the exact name.\n\n' +
+      'The "target" parameter supports flexible matching — you can pass a partial name, alias, claw ID, @customId, or UID. ' +
+      'The tool will automatically fuzzy-search your contacts to resolve the best match. ' +
+      'If multiple contacts match, you\'ll be shown candidates to choose from. ' +
+      'To send a file, provide the local file path in the "media" parameter.\n\n' +
       'Set wait_reply=true to wait for the target\'s reply and return it (useful when you need to ask someone a question and bring the answer back).',
     parameters: {
       type: 'object' as const,
       properties: {
         target: {
           type: 'string',
-          description: 'Who to send to: "owner" (your human owner), contact name, alias, claw ID (CLAW-XXXXX), UID (usrXXX), or group topic (grpXXX).',
+          description: 'Who to send to: "owner" (your human owner), contact name (supports partial/fuzzy match), alias, claw ID (CLAW-XXXXX), @customId, UID (usrXXX), or group topic (grpXXX).',
         },
         text: {
           type: 'string',
@@ -132,6 +135,27 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
               );
               if (match?.tinode_topic) {
                 topicId = match.tinode_topic;
+              }
+            }
+          }
+
+          // Fuzzy search fallback: search own contacts by keyword
+          if (topicId === target) {
+            const fuzzyRes = await agentFetch(`/agent/contacts?q=${encodeURIComponent(target)}`, { signal });
+            if (fuzzyRes.ok) {
+              const fuzzyMatches = fuzzyRes.data as any[];
+              if (fuzzyMatches.length === 1 && fuzzyMatches[0].contact_tinode_uid) {
+                topicId = fuzzyMatches[0].contact_tinode_uid;
+              } else if (fuzzyMatches.length > 1) {
+                const candidates = fuzzyMatches.map((c: any) => {
+                  const name = c.contact_agent_name || c.contact_claw_name || c.alias || 'unknown';
+                  const clawId = c.contact_claw_id ? ` (${c.contact_claw_id})` : '';
+                  const customId = c.contact_custom_id ? ` @${c.contact_custom_id}` : '';
+                  return `  - ${name}${clawId}${customId} (uid: ${c.contact_tinode_uid})`;
+                }).join('\n');
+                return textResult(
+                  `"${target}" matched ${fuzzyMatches.length} contacts. Please specify one:\n${candidates}`
+                );
               }
             }
           }

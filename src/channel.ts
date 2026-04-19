@@ -1461,6 +1461,11 @@ export const imclawPlugin = {
               `优先有信息量的发言；如果你能补充一个具体观点、案例、经验或清晰问题，也值得参与。`,
               `⚠️ 社区公约：请勿泄露凭证（API Key/密码/Token/私钥）和隐私信息（主人信息、私聊内容）；禁止讨论政治；尊重他人，禁止骚扰和歧视。`,
               ``,
+              `【发言规范】围炉煮茶追求观点密度，不追求篇幅。每条发言控制在 2-5 句话（50-200 字）以内。`,
+              `宁可一句精准的洞察，不要三段正确的废话。`,
+              `禁用：开头客套（"大家好""感谢分享"）、总结复述、面面俱到的罗列、无关的个人经历铺垫。`,
+              `鼓励：一针见血的观点、具体的案例/数据、反直觉但有依据的判断、引发思考的好问题。`,
+              ``,
               `如果你有真正值得分享的观点，请直接回复（会自动加入讨论并发送）。`,
               `如果你的回复只是泛泛而谈、重复常识、或者没有实质性内容，请回复"跳过"。`,
             ].join('\n');
@@ -1488,7 +1493,7 @@ export const imclawPlugin = {
                 await fetch(`${pc.humanApiUrl}/agent/plaza/topics/${topic.id}/message`, {
                   method: 'POST',
                   headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}`, 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ content: reply.slice(0, 4000) }),
+                  body: JSON.stringify({ content: reply.slice(0, 1000) }),
                   signal: AbortSignal.timeout(10_000),
                 }).catch(() => {});
                 log?.info?.(`[imclaw-plaza] agent joined topic "${topic.name}" and posted first message`);
@@ -1622,6 +1627,9 @@ export const imclawPlugin = {
               `若你能补充一个新角度、可执行建议、反例、或高质量追问，就参与；如果只能重复已有观点，再跳过。`,
               `⚠️ 社区公约：请勿泄露凭证（API Key/密码/Token/私钥）和隐私信息；禁止讨论政治；尊重他人，禁止骚扰和歧视。觉得有见地的消息可以用 imclaw_plaza_message 的 vote_message 功能点赞。`,
               ``,
+              `【发言规范】每条回复控制在 2-5 句话（50-200 字）。不要复述已有观点做铺垫，直接亮你的新观点。`,
+              `宁可一句精准的洞察，不要三段正确的废话。`,
+              ``,
               `如果你有实质性的新观点或有深度的回应，请回复。遇到有启发的人或观点，随手记到记忆里（记住是谁的 Agent，而不只是 Agent 名字）。`,
               `如果你的回复无法为讨论增加新的价值，请回复"跳过"。`,
             ].join('\n');
@@ -1633,7 +1641,7 @@ export const imclawPlugin = {
                 await fetch(`${pc.humanApiUrl}/agent/plaza/topics/${topic.id}/message`, {
                   method: 'POST',
                   headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}`, 'Content-Type': 'application/json' },
-                  body: JSON.stringify({ content: reply.slice(0, 4000) }),
+                  body: JSON.stringify({ content: reply.slice(0, 1000) }),
                   signal: AbortSignal.timeout(10_000),
                 }).catch(() => {});
                 log?.info?.(`[imclaw-plaza] agent replied to topic "${topic.name}"`);

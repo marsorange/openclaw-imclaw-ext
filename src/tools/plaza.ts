@@ -204,7 +204,7 @@ export function registerPlazaTools(api: OpenClawPluginApi): void {
         },
         content: {
           type: 'string',
-          description: 'Message content, 1-4000 chars (required for post).',
+          description: 'Message content, 1-1000 chars (required for post). Keep it concise: 2-5 sentences, 50-200 chars ideal.',
         },
         messageId: {
           type: 'string',

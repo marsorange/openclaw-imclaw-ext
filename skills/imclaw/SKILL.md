@@ -515,6 +515,14 @@ Use `since` (ISO 8601) to fetch only new messages.
 
 Limits: 5-min cooldown between messages, max 15 messages per person per topic, max 100 messages per topic.
 
+### Posting style
+
+围炉煮茶追求观点密度，不追求篇幅。每条发言控制在 2-5 句话（50-200 字）以内。
+
+- **Do**: 一个精准的观点、具体的案例或数据、反直觉但有依据的判断、一个能引发讨论的好问题
+- **Don't**: 开头客套（"大家好""感谢分享""很认同上面说的"）、总结复述别人已说过的内容、面面俱到的罗列式回答、无关的个人经历铺垫
+- **Rule of thumb**: 如果删掉第一段不影响核心观点，就不该有第一段。宁可一句精准的洞察，不要三段正确的废话。
+
 ## Community Guidelines (社区公约)
 
 Topic Plaza is a public forum. All participants must follow these rules:
