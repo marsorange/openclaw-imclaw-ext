@@ -63,6 +63,9 @@ interface AccountContext {
   mediaDir: string;
   configConnectKey: string | null;
   ownerTinodeUid: string | null;
+  stopped: boolean;
+  authPaused: boolean;
+  cleanup: () => Promise<void>;
 }
 
 const accounts = new Map<string, AccountContext>();
@@ -170,6 +173,21 @@ function buildBasicAuth(username: string, password: string): string {
   return Buffer.from(`${username}:${password}`).toString('base64');
 }
 
+function wait(ms: number, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve(true);
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve(false);
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
 function resolveCredentialScopeId(cred: { username: string; clawId?: string }): string {
   return cred.clawId || cred.username;
 }
@@ -177,7 +195,7 @@ function resolveCredentialScopeId(cred: { username: string; clawId?: string }): 
 async function fetchAgentOwner(
   humanApiUrl: string,
   basicAuth: string,
-): Promise<{ owner?: any; unauthorized: boolean; ok: boolean }> {
+): Promise<{ owner?: any; unauthorized: boolean; permanent: boolean; ok: boolean }> {
   try {
     const res = await fetch(`${humanApiUrl}/agent/owner`, {
       headers: { 'Authorization': `Basic ${basicAuth}` },
@@ -187,15 +205,19 @@ async function fetchAgentOwner(
       return {
         ok: true,
         unauthorized: false,
+        permanent: false,
         owner: await res.json() as any,
       };
     }
-    if (res.status === 401 || res.status === 403) {
-      return { ok: false, unauthorized: true };
+    if (res.status === 410) {
+      return { ok: false, unauthorized: true, permanent: true };
     }
-    return { ok: false, unauthorized: false };
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, unauthorized: true, permanent: false };
+    }
+    return { ok: false, unauthorized: false, permanent: false };
   } catch {
-    return { ok: false, unauthorized: false };
+    return { ok: false, unauthorized: false, permanent: false };
   }
 }
 
@@ -876,6 +898,49 @@ export const imclawPlugin = {
         throw new Error('imclaw: account must have username/password or a valid connectKey');
       }
 
+      const waitForReplacementConnectKey = async (previousKey: string | null): Promise<{
+        connectKey: string;
+        creds: CachedCredential;
+        agentName?: string;
+      } | null> => {
+        let lastAttemptedKey: string | null = null;
+        let lastAttemptAt = 0;
+        log?.error?.(
+          '[imclaw] credentials are invalid. Account is paused locally and will only try again after a new connect key is configured.',
+        );
+
+        while (!abortSignal.aborted) {
+          try {
+            const rt = getPluginRuntime();
+            const currentCfg = await rt?.config.loadConfig() as Record<string, any> | undefined;
+            const currentAccount = currentCfg?.channels?.imclaw?.accounts?.[accountId];
+            const nextKey = currentAccount?.connectKey as string | undefined;
+            const agentName = (currentAccount?.agentName as string) || undefined;
+            const now = Date.now();
+
+            if (nextKey && nextKey !== previousKey) {
+              if (nextKey !== lastAttemptedKey || now - lastAttemptAt > 5 * 60_000) {
+                lastAttemptedKey = nextKey;
+                lastAttemptAt = now;
+                try {
+                  log?.info?.('[imclaw] new connect key detected; exchanging credentials...');
+                  const creds = await exchangeConnectKey(nextKey, pc.humanApiUrl, agentName);
+                  return { connectKey: nextKey, creds, agentName };
+                } catch (err: any) {
+                  log?.error?.(`[imclaw] new connect key exchange failed: ${err.message}`);
+                }
+              }
+            }
+          } catch (err: any) {
+            log?.warn?.(`[imclaw] reconnect config check failed: ${err.message}`);
+          }
+
+          const keepWaiting = await wait(30_000, abortSignal);
+          if (!keepWaiting) return null;
+        }
+        return null;
+      };
+
       const httpBase = pc.httpBaseUrl || undefined;
       log?.info?.(`[imclaw] httpBaseUrl resolved to: ${httpBase || '(none — file uploads will fail)'}`);
 
@@ -948,24 +1013,78 @@ export const imclawPlugin = {
           throw err;
         }
       }
-      const initialHeartbeatAuth = buildBasicAuth(username, password);
-      const ownerCheck = await fetchAgentOwner(pc.humanApiUrl, initialHeartbeatAuth);
-      if (ownerCheck.unauthorized) {
+      let initialHeartbeatAuth = buildBasicAuth(username, password);
+      let ownerCheck = await fetchAgentOwner(pc.humanApiUrl, initialHeartbeatAuth);
+      while (ownerCheck.unauthorized) {
         if (configConnectKey) {
           saveCredsCache({});
         }
         try { await bridge.stop(); } catch { /* ignore */ }
-        throw new Error(
-          configConnectKey
-            ? 'Cached IMClaw credentials are stale after a rollback or claw rebind. Regenerate the connect key in IMClaw and restart OpenClaw.'
-            : 'IMClaw credentials are no longer recognized by the Human API. Reconnect the agent.'
-        );
+        if (ownerCheck.permanent) {
+          saveCredsCache({});
+          log?.error?.('[imclaw] agent has been permanently deleted from the server.');
+        } else {
+          log?.error?.(
+            configConnectKey
+              ? '[imclaw] cached IMClaw credentials are stale after a rollback or claw rebind.'
+              : '[imclaw] IMClaw credentials are no longer recognized by the Human API.',
+          );
+        }
+
+        const replacement = await waitForReplacementConnectKey(configConnectKey);
+        if (!replacement) return;
+
+        username = replacement.creds.username;
+        password = replacement.creds.password;
+        credentialScopeId = resolveCredentialScopeId(replacement.creds);
+        configConnectKey = replacement.connectKey;
+        if (replacement.creds.serverUrl && !pc.serverUrl) pc.serverUrl = replacement.creds.serverUrl;
+        if (replacement.creds.apiKey && !pc.apiKey) pc.apiKey = replacement.creds.apiKey;
+        if (replacement.creds.httpBaseUrl && !pc.httpBaseUrl) pc.httpBaseUrl = replacement.creds.httpBaseUrl;
+        saveCredsCache({ [replacement.connectKey]: replacement.creds });
+
+        bridgeConfig.tinodeServerUrl = replacement.creds.serverUrl || bridgeConfig.tinodeServerUrl;
+        bridgeConfig.tinodeUsername = replacement.creds.username;
+        bridgeConfig.tinodePassword = replacement.creds.password;
+        bridgeConfig.clawId = credentialScopeId || replacement.creds.username;
+        if (replacement.creds.apiKey) bridgeConfig.tinodeApiKey = replacement.creds.apiKey;
+        if (replacement.creds.httpBaseUrl) bridgeConfig.httpBaseUrl = replacement.creds.httpBaseUrl;
+
+        bridge = new ImclawBridge(bridgeConfig);
+        registerMessageHandler(bridge, accountId, log, mediaDir, trustedHosts);
+        try {
+          await bridge.start();
+        } catch (err: any) {
+          log?.error?.(`[imclaw] reconnect with new credentials failed: ${err.message}`);
+          continue;
+        }
+        initialHeartbeatAuth = buildBasicAuth(username, password);
+        ownerCheck = await fetchAgentOwner(pc.humanApiUrl, initialHeartbeatAuth);
       }
       log?.info?.(`[imclaw] account ${accountId} connected`);
 
       // Build AccountContext (mutable — reconnect swaps bridge/heartbeat fields)
       const heartbeatAuth = initialHeartbeatAuth;
-      const ctx: AccountContext = {
+
+      let ctx: AccountContext;
+      let cleanupDone = false;
+      const cleanup = async () => {
+        if (cleanupDone) return;
+        cleanupDone = true;
+        ctx.stopped = true;
+        log?.info?.(`[imclaw] stopping account ${accountId}`);
+        clearInterval(ctx.heartbeatTimer);
+        if (ctx.plazaDiscoveryTimer) clearTimeout(ctx.plazaDiscoveryTimer);
+        if (ctx.plazaPollTimer) clearTimeout(ctx.plazaPollTimer);
+        if (ctx.momentsTimer) clearTimeout(ctx.momentsTimer);
+        try {
+          await ctx.bridge.stop();
+        } catch (err: any) {
+          log?.error?.(`[imclaw] error stopping bridge: ${err.message}`);
+        }
+        accounts.delete(accountId);
+      };
+      ctx = {
         bridge,
         heartbeatTimer: null as any, // set below
         plazaDiscoveryTimer: null,
@@ -979,8 +1098,80 @@ export const imclawPlugin = {
         mediaDir,
         configConnectKey,
         ownerTinodeUid: null,
+        stopped: false,
+        authPaused: false,
+        cleanup,
+      };
+
+      /**
+       * Authenticated fetch helper for Human API calls.
+       * Detects 410 Gone (agent deleted) and triggers full disconnect.
+       * All periodic/scheduled API calls should use this instead of raw fetch.
+       */
+      const apiFetch = async (path: string, init?: RequestInit): Promise<Response | null> => {
+        if (ctx.stopped || ctx.authPaused) return null;
+        try {
+          const res = await fetch(`${ctx.humanApiUrl}${path}`, {
+            ...init,
+            headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}`, ...init?.headers },
+            signal: init?.signal ?? AbortSignal.timeout(10_000),
+          });
+          if (res.status === 410) {
+            const body: any = await res.clone().json().catch(() => ({}));
+            if (body?.permanent === true || body?.error === 'Agent deleted') {
+              ctx.log?.error?.(`[imclaw] 410 Gone from ${path} — agent permanently deleted. Disconnecting...`);
+              saveCredsCache({});
+              ctx.stopped = true;
+              try { await ctx.cleanup(); } catch { /* ignore */ }
+              return null;
+            }
+            return null;
+          }
+          return res;
+        } catch {
+          return null;
+        }
       };
       accounts.set(accountId, ctx);
+
+      const reconnectWithReplacementConnectKey = async (): Promise<boolean> => {
+        ctx.authPaused = true;
+        try { await ctx.bridge.stop(); } catch { /* ignore */ }
+
+        const replacement = await waitForReplacementConnectKey(ctx.configConnectKey);
+        if (!replacement) return false;
+
+        username = replacement.creds.username;
+        password = replacement.creds.password;
+        credentialScopeId = resolveCredentialScopeId(replacement.creds);
+        ctx.configConnectKey = replacement.connectKey;
+        ctx.heartbeatAuth = buildBasicAuth(replacement.creds.username, replacement.creds.password);
+        saveCredsCache({ [replacement.connectKey]: replacement.creds });
+
+        bridgeConfig.tinodeServerUrl = replacement.creds.serverUrl || bridgeConfig.tinodeServerUrl;
+        bridgeConfig.tinodeUsername = replacement.creds.username;
+        bridgeConfig.tinodePassword = replacement.creds.password;
+        bridgeConfig.clawId = credentialScopeId || replacement.creds.username;
+        if (replacement.creds.apiKey) bridgeConfig.tinodeApiKey = replacement.creds.apiKey;
+        if (replacement.creds.httpBaseUrl) bridgeConfig.httpBaseUrl = replacement.creds.httpBaseUrl;
+
+        const newBridge = new ImclawBridge(bridgeConfig);
+        registerMessageHandler(newBridge, accountId, log, mediaDir, trustedHosts);
+        await newBridge.start();
+
+        const owner = await fetchAgentOwner(ctx.humanApiUrl, ctx.heartbeatAuth);
+        if (owner.unauthorized) {
+          try { await newBridge.stop(); } catch { /* ignore */ }
+          saveCredsCache({});
+          log?.error?.('[imclaw] replacement credentials were rejected by Human API.');
+          return false;
+        }
+        ctx.bridge = newBridge;
+        ctx.ownerTinodeUid = owner.owner?.tinode_uid || ctx.ownerTinodeUid;
+        ctx.authPaused = false;
+        log?.info?.('[imclaw] reconnected with replacement connect key');
+        return true;
+      };
 
       // Fetch and cache owner Tinode UID for "owner" target resolution
       if (ownerCheck.ok) {
@@ -1008,14 +1199,10 @@ export const imclawPlugin = {
       profilePatch.platform = 'openclaw';
       if (Object.keys(profilePatch).length > 0) {
         try {
-          await fetch(`${pc.humanApiUrl}/agent/profile`, {
+          await apiFetch('/agent/profile', {
             method: 'PATCH',
-            headers: {
-              'Authorization': `Basic ${heartbeatAuth}`,
-              'Content-Type': 'application/json',
-            },
+            headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(profilePatch),
-            signal: AbortSignal.timeout(10_000),
           });
           log?.info?.(
             `[imclaw] profile synced${agentNameToSync ? ` (name: ${agentNameToSync})` : ''}${pluginVersion ? ` (version: ${pluginVersion})` : ''}`,
@@ -1026,28 +1213,22 @@ export const imclawPlugin = {
       }
 
       // Sync group and contact subscriptions on startup (parallel)
-      await Promise.allSettled([
-        fetch(`${pc.humanApiUrl}/agent/groups/sync`, {
-          method: 'POST',
-          headers: { 'Authorization': `Basic ${heartbeatAuth}` },
-          signal: AbortSignal.timeout(15_000),
-        }).then(() => log?.info?.('[imclaw] group subscriptions synced'))
-         .catch(() => log?.warn?.('[imclaw] group sync failed (non-critical)')),
-        fetch(`${pc.humanApiUrl}/agent/contacts/sync`, {
-          method: 'POST',
-          headers: { 'Authorization': `Basic ${heartbeatAuth}` },
-          signal: AbortSignal.timeout(15_000),
-        }).then(() => log?.info?.('[imclaw] contact subscriptions synced'))
-         .catch(() => log?.warn?.('[imclaw] contact sync failed (non-critical)')),
-      ]);
+      if (!ctx.stopped) {
+        await Promise.allSettled([
+          apiFetch('/agent/groups/sync', { method: 'POST' })
+            .then(r => r ? log?.info?.('[imclaw] group subscriptions synced') : undefined)
+            .catch(() => log?.warn?.('[imclaw] group sync failed (non-critical)')),
+          apiFetch('/agent/contacts/sync', { method: 'POST' })
+            .then(r => r ? log?.info?.('[imclaw] contact subscriptions synced') : undefined)
+            .catch(() => log?.warn?.('[imclaw] contact sync failed (non-critical)')),
+        ]);
+      }
 
       // Fetch group list and apply per-group message limits
+      if (!ctx.stopped) {
       try {
-        const groupsRes = await fetch(`${pc.humanApiUrl}/agent/groups`, {
-          headers: { 'Authorization': `Basic ${heartbeatAuth}` },
-          signal: AbortSignal.timeout(10_000),
-        });
-        if (groupsRes.ok) {
+        const groupsRes = await apiFetch('/agent/groups');
+        if (groupsRes?.ok) {
           const groups = await groupsRes.json() as any[];
           for (const g of groups) {
             if (g.tinode_topic && g.max_messages) {
@@ -1059,17 +1240,42 @@ export const imclawPlugin = {
       } catch {
         log?.warn?.('[imclaw] group list fetch failed (non-critical)');
       }
+      } // end if (!ctx.stopped)
 
       // Presence heartbeat — reads ctx.heartbeatAuth so reconnect updates take effect
       const heartbeatUrl = `${pc.humanApiUrl}/agent/heartbeat`;
       let refreshingCreds = false;
       const sendHeartbeat = async () => {
+        if (ctx.stopped || ctx.authPaused) return;
         try {
           const res = await fetch(heartbeatUrl, {
             method: 'POST',
             headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}` },
             signal: AbortSignal.timeout(10_000),
           });
+
+          // Agent permanently deleted (410 Gone) — full disconnect
+          if (res.status === 410) {
+            log?.error?.('[imclaw] agent permanently deleted from server (410 Gone). Disconnecting...');
+            saveCredsCache({});
+            ctx.stopped = true;
+            try { await cleanup(); } catch { /* ignore */ }
+            return;
+          }
+
+          if (res.status === 403) {
+            const body: any = await res.clone().json().catch(() => ({}));
+            if (body?.error === 'force_reconnect') {
+              log?.info?.('[imclaw] force reconnect requested by server');
+              try { await ctx.bridge.stop(); } catch { /* ignore */ }
+              const newBridge = new ImclawBridge(bridgeConfig);
+              registerMessageHandler(newBridge, accountId, log, mediaDir, trustedHosts);
+              await newBridge.start();
+              ctx.bridge = newBridge;
+              return;
+            }
+          }
+
           // Credentials rotated — hot-refresh from cache
           if (res.status === 401 && !refreshingCreds) {
             refreshingCreds = true;
@@ -1077,11 +1283,20 @@ export const imclawPlugin = {
               const cache = loadCredsCache();
               const entries = Object.values(cache);
               if (entries.length === 0) {
-                log?.error?.('[imclaw] heartbeat 401 and no cached credentials are available. Regenerate the connect key and restart.');
+                log?.error?.('[imclaw] heartbeat 401 and no cached credentials are available.');
+                saveCredsCache({});
+                const recovered = await reconnectWithReplacementConnectKey();
+                if (!recovered) await cleanup();
                 return;
               }
               const cred = entries[entries.length - 1];
-              if (!cred.password) return;
+              if (!cred.password) {
+                log?.error?.('[imclaw] heartbeat 401 and cached entry has no password.');
+                saveCredsCache({});
+                const recovered = await reconnectWithReplacementConnectKey();
+                if (!recovered) await cleanup();
+                return;
+              }
 
               // Extract current username and password from heartbeatAuth
               const decoded = Buffer.from(ctx.heartbeatAuth, 'base64').toString('utf-8');
@@ -1092,7 +1307,9 @@ export const imclawPlugin = {
                 if (ctx.configConnectKey) {
                   saveCredsCache({});
                 }
-                log?.error?.('[imclaw] heartbeat 401 with unchanged cached credentials. The cached agent identity is stale after a rollback or rebind. Regenerate the connect key and restart OpenClaw.');
+                log?.error?.('[imclaw] heartbeat 401 with unchanged cached credentials.');
+                const recovered = await reconnectWithReplacementConnectKey();
+                if (!recovered) await cleanup();
                 return;
               }
 
@@ -1114,6 +1331,9 @@ export const imclawPlugin = {
               log?.info?.('[imclaw] credentials refreshed and bridge reconnected');
             } catch (err: any) {
               log?.error?.(`[imclaw] credential refresh failed: ${err.message}`);
+              const recovered = await reconnectWithReplacementConnectKey().catch(() => false);
+              if (!recovered) await cleanup();
+              return;
             } finally {
               refreshingCreds = false;
             }
@@ -1175,12 +1395,13 @@ export const imclawPlugin = {
 
       // Helper: report plaza activity to the monitoring endpoint (best-effort, fire-and-forget)
       const reportPlazaActivity = (event: string, detail?: string) => {
-        fetch(`${pc.humanApiUrl}/agent/plaza/activity`, {
+        if (ctx.stopped) return;
+        apiFetch('/agent/plaza/activity', {
           method: 'POST',
-          headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}`, 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ event, detail: detail?.slice(0, 500) }),
           signal: AbortSignal.timeout(5_000),
-        }).catch(() => {}); // fire-and-forget
+        }); // fire-and-forget
       };
 
       // Helper: dispatch an internal IMClaw context to the agent and collect its reply
@@ -1269,11 +1490,8 @@ export const imclawPlugin = {
         plazaAutopilotEnabled: boolean;
       }> => {
         try {
-          const res = await fetch(`${pc.humanApiUrl}/agent/settings`, {
-            headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}` },
-            signal: AbortSignal.timeout(10_000),
-          });
-          if (!res.ok) {
+          const res = await apiFetch('/agent/settings');
+          if (!res || !res.ok) {
             return { momentsAutopilotEnabled: true, plazaAutopilotEnabled: true };
           }
           const data = await res.json() as any;
@@ -1288,6 +1506,7 @@ export const imclawPlugin = {
 
       // Moments autonomy loop: periodically decide whether to post a moment.
       const runMomentsCheck = async () => {
+        if (ctx.stopped) return;
         try {
           const settings = await getAutonomyFeatureSettings();
           if (!settings.momentsAutopilotEnabled) {
@@ -1295,10 +1514,8 @@ export const imclawPlugin = {
             return;
           }
 
-          const mineRes = await fetch(`${pc.humanApiUrl}/agent/moments/mine?limit=20`, {
-            headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}` },
-            signal: AbortSignal.timeout(10_000),
-          });
+          const mineRes = await apiFetch('/agent/moments/mine?limit=20');
+          if (!mineRes) return;
           const myMoments = mineRes.ok ? (await mineRes.json() as any[]) : [];
           const latest = myMoments[0] || null;
           const lastAt = latest?.created_at ? new Date(latest.created_at).getTime() : 0;
@@ -1315,10 +1532,8 @@ export const imclawPlugin = {
             return;
           }
 
-          const convRes = await fetch(`${pc.humanApiUrl}/agent/conversations`, {
-            headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}` },
-            signal: AbortSignal.timeout(10_000),
-          });
+          const convRes = await apiFetch('/agent/conversations');
+          if (!convRes) return;
           const conversations = convRes.ok ? (await convRes.json() as any[]) : [];
           const activeConversations = conversations
             .slice(0, 5)
@@ -1392,6 +1607,7 @@ export const imclawPlugin = {
 
       // Discovery: fetch available topics → present each to agent → join + post if agent replies
       const runDiscovery = async () => {
+        if (ctx.stopped) return;
         const settings = await getAutonomyFeatureSettings();
         if (!settings.plazaAutopilotEnabled) {
           log?.info?.('[imclaw-plaza] discovery disabled by owner settings');
@@ -1400,10 +1616,8 @@ export const imclawPlugin = {
         reportPlazaActivity('discovery_start');
         try {
           // Fetch what the agent already joined to skip those
-          const myRes = await fetch(`${pc.humanApiUrl}/agent/plaza/my-topics`, {
-            headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}` },
-            signal: AbortSignal.timeout(10_000),
-          });
+          const myRes = await apiFetch('/agent/plaza/my-topics');
+          if (!myRes) return;
           const myTopicIds = new Set<string>();
           if (myRes.ok) {
             const myTopics = await myRes.json() as any[];
@@ -1412,22 +1626,14 @@ export const imclawPlugin = {
 
           // Discover popular + newest + rising, merge & deduplicate
           const [popularRes, newestRes, risingRes] = await Promise.all([
-            fetch(`${pc.humanApiUrl}/agent/plaza/topics?sort=popular&limit=5`, {
-              headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}` },
-              signal: AbortSignal.timeout(15_000),
-            }),
-            fetch(`${pc.humanApiUrl}/agent/plaza/topics?sort=newest&limit=5`, {
-              headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}` },
-              signal: AbortSignal.timeout(15_000),
-            }),
-            fetch(`${pc.humanApiUrl}/agent/plaza/topics?sort=rising&limit=5`, {
-              headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}` },
-              signal: AbortSignal.timeout(15_000),
-            }),
+            apiFetch('/agent/plaza/topics?sort=popular&limit=5'),
+            apiFetch('/agent/plaza/topics?sort=newest&limit=5'),
+            apiFetch('/agent/plaza/topics?sort=rising&limit=5'),
           ]);
-          const popular = popularRes.ok ? await popularRes.json() as any[] : [];
-          const newest = newestRes.ok ? await newestRes.json() as any[] : [];
-          const rising = risingRes.ok ? await risingRes.json() as any[] : [];
+          if (ctx.stopped) return;
+          const popular = popularRes?.ok ? await popularRes.json() as any[] : [];
+          const newest = newestRes?.ok ? await newestRes.json() as any[] : [];
+          const rising = risingRes?.ok ? await risingRes.json() as any[] : [];
           const seen = new Set<string>();
           const candidates = [...popular, ...newest, ...rising].filter(t => {
             if (seen.has(t.id) || myTopicIds.has(t.id)) return false;
@@ -1481,21 +1687,19 @@ export const imclawPlugin = {
               }
 
               // Agent wants to join — do join + post first message
-              const joinRes = await fetch(`${pc.humanApiUrl}/agent/plaza/topics/${topic.id}/join`, {
+              const joinRes = await apiFetch(`/agent/plaza/topics/${topic.id}/join`, {
                 method: 'POST',
-                headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}`, 'Content-Type': 'application/json' },
-                signal: AbortSignal.timeout(10_000),
-              }).catch(() => null);
+                headers: { 'Content-Type': 'application/json' },
+              });
 
               if (joinRes?.ok) {
                 joined++;
                 // Post the agent's reply as its first message in the topic
-                await fetch(`${pc.humanApiUrl}/agent/plaza/topics/${topic.id}/message`, {
+                await apiFetch(`/agent/plaza/topics/${topic.id}/message`, {
                   method: 'POST',
-                  headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}`, 'Content-Type': 'application/json' },
+                  headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ content: reply.slice(0, 1000) }),
-                  signal: AbortSignal.timeout(10_000),
-                }).catch(() => {});
+                });
                 log?.info?.(`[imclaw-plaza] agent joined topic "${topic.name}" and posted first message`);
                 reportPlazaActivity('topic_joined', topic.name);
               }
@@ -1511,10 +1715,8 @@ export const imclawPlugin = {
           // Code-driven: capture agent's topic idea as text, then create via API directly.
           if (candidates.length <= 2 && joined === 0) {
             try {
-              const creditsRes = await fetch(`${pc.humanApiUrl}/agent/plaza/my-credits`, {
-                headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}` },
-                signal: AbortSignal.timeout(10_000),
-              });
+              const creditsRes = await apiFetch('/agent/plaza/my-credits');
+              if (!creditsRes) return;
               const credits = creditsRes.ok ? await creditsRes.json() as any : null;
               if (credits && credits.available > 0) {
                 const createPrompt = [
@@ -1554,12 +1756,11 @@ export const imclawPlugin = {
                   if (title) {
                     const createBody: Record<string, unknown> = { title, context };
                     if (tagList.length) createBody.tags = tagList;
-                    const createRes = await fetch(`${pc.humanApiUrl}/agent/plaza/topics`, {
+                    const createRes = await apiFetch('/agent/plaza/topics', {
                       method: 'POST',
-                      headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}`, 'Content-Type': 'application/json' },
+                      headers: { 'Content-Type': 'application/json' },
                       body: JSON.stringify(createBody),
-                      signal: AbortSignal.timeout(10_000),
-                    }).catch(() => null);
+                    });
                     if (createRes?.ok) {
                       const created = await createRes.json().catch(() => null) as any;
                       log?.info?.(`[imclaw-plaza] agent created topic "${title}" (id: ${created?.id})`);
@@ -1585,6 +1786,7 @@ export const imclawPlugin = {
 
       // Poll: for already-joined topics, fetch new messages → dispatch → post reply
       const runPoll = async () => {
+        if (ctx.stopped) return;
         try {
           const settings = await getAutonomyFeatureSettings();
           if (!settings.plazaAutopilotEnabled) {
@@ -1592,20 +1794,17 @@ export const imclawPlugin = {
             return;
           }
 
-          const myTopicsRes = await fetch(`${pc.humanApiUrl}/agent/plaza/my-topics`, {
-            headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}` },
-            signal: AbortSignal.timeout(15_000),
-          });
-          if (!myTopicsRes.ok) return;
+          const myTopicsRes = await apiFetch('/agent/plaza/my-topics');
+          if (!myTopicsRes || !myTopicsRes.ok) return;
           const myTopics = await myTopicsRes.json() as any[];
 
           for (const topic of myTopics) {
+            if (ctx.stopped) return;
             const since = topic.my_last_message_at || topic.created_at;
-            const msgsRes = await fetch(
-              `${pc.humanApiUrl}/agent/plaza/topics/${topic.id}/messages?since=${encodeURIComponent(since)}&limit=20`,
-              { headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}` }, signal: AbortSignal.timeout(10_000) },
+            const msgsRes = await apiFetch(
+              `/agent/plaza/topics/${topic.id}/messages?since=${encodeURIComponent(since)}&limit=20`,
             );
-            if (!msgsRes.ok) continue;
+            if (!msgsRes || !msgsRes.ok) continue;
             const messages = await msgsRes.json() as any[];
             if (messages.length === 0) continue;
 
@@ -1638,12 +1837,12 @@ export const imclawPlugin = {
               const reply = await dispatchPlaza(body, topic.id, topic.name, topic.id);
 
               if (reply && !/^(跳过|skip|pass)/i.test(reply.trim())) {
-                await fetch(`${pc.humanApiUrl}/agent/plaza/topics/${topic.id}/message`, {
+                await apiFetch(`/agent/plaza/topics/${topic.id}/message`, {
                   method: 'POST',
-                  headers: { 'Authorization': `Basic ${ctx.heartbeatAuth}`, 'Content-Type': 'application/json' },
+                  headers: { 'Content-Type': 'application/json' },
                   body: JSON.stringify({ content: reply.slice(0, 1000) }),
-                  signal: AbortSignal.timeout(10_000),
-                }).catch(() => {});
+                });
+                if (ctx.stopped) return;
                 log?.info?.(`[imclaw-plaza] agent replied to topic "${topic.name}"`);
               }
             } catch (dispatchErr: any) {
@@ -1668,21 +1867,27 @@ export const imclawPlugin = {
 
       const scheduleDiscovery = (delay: number) => {
         return setTimeout(async () => {
+          if (ctx.stopped) return;
           await runDiscovery();
+          if (ctx.stopped) return;
           const jitter = (Math.random() - 0.5) * 2 * PLAZA_DISCOVERY_JITTER;
           ctx.plazaDiscoveryTimer = scheduleDiscovery(PLAZA_DISCOVERY_CYCLE + jitter);
         }, delay);
       };
       const schedulePoll = (delay: number) => {
         return setTimeout(async () => {
+          if (ctx.stopped) return;
           await runPoll();
+          if (ctx.stopped) return;
           const jitter = (Math.random() - 0.5) * 2 * PLAZA_POLL_JITTER;
           ctx.plazaPollTimer = schedulePoll(PLAZA_POLL_CYCLE + jitter);
         }, delay);
       };
       const scheduleMoments = (delay: number) => {
         return setTimeout(async () => {
+          if (ctx.stopped) return;
           await runMomentsCheck();
+          if (ctx.stopped) return;
           const jitter = (Math.random() - 0.5) * 2 * MOMENTS_JITTER;
           ctx.momentsTimer = scheduleMoments(MOMENTS_CYCLE + jitter);
         }, delay);
@@ -1694,20 +1899,6 @@ export const imclawPlugin = {
       ctx.momentsTimer = scheduleMoments(90_000);
 
       // Keep alive until abort — cleanup reads ctx so reconnect swaps are reflected
-      const cleanup = async () => {
-        log?.info?.(`[imclaw] stopping account ${accountId}`);
-        clearInterval(ctx.heartbeatTimer);
-        if (ctx.plazaDiscoveryTimer) clearTimeout(ctx.plazaDiscoveryTimer);
-        if (ctx.plazaPollTimer) clearTimeout(ctx.plazaPollTimer);
-        if (ctx.momentsTimer) clearTimeout(ctx.momentsTimer);
-        try {
-          await ctx.bridge.stop();
-        } catch (err: any) {
-          log?.error?.(`[imclaw] error stopping bridge: ${err.message}`);
-        }
-        accounts.delete(accountId);
-      };
-
       // Handle already-aborted signal (e.g. abort fired during startup sync)
       if (abortSignal.aborted) {
         await cleanup();
