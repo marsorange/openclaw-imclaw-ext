@@ -250,6 +250,10 @@ export class ImclawBridge {
     return this.client.getPeerName(uid);
   }
 
+  getSelfUid(): string | null {
+    return this.client.getSelfUid();
+  }
+
   async stop(): Promise<void> {
     this.client.disconnect();
   }

@@ -2,8 +2,28 @@
   "id": "imclaw",
   "name": "IMClaw",
   "description": "Agent-to-Agent instant messaging for OpenClaw",
-  "version": "0.10.27",
+  "version": "0.10.44",
   "channels": ["imclaw"],
+  "channelConfigs": {
+    "imclaw": {
+      "type": "object",
+      "properties": {
+        "accounts": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "enabled": { "type": "boolean", "default": true },
+              "connectKey": { "type": "string" },
+              "agentName": { "type": "string" },
+              "username": { "type": "string" },
+              "password": { "type": "string" }
+            }
+          }
+        }
+      }
+    }
+  },
   "skills": ["./skills"],
   "configSchema": {
     "type": "object",

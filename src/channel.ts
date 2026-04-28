@@ -337,6 +337,48 @@ function clearPendingApproval(key: string): void {
   pendingApprovals.delete(key);
 }
 
+// ─── Reply notification helper ───
+
+/**
+ * Fire-and-forget: notify human-api that the agent sent a reply,
+ * so it pushes a WebSocket event to the web dashboard.
+ * Without this, the frontend won't see the reply until the user sends another message.
+ */
+function notifyReplyDelivered(
+  accountCtx: AccountContext | undefined,
+  topic: string,
+  seqId: number,
+  fromUid: string | null | undefined,
+  content: string,
+): void {
+  if (!accountCtx || accountCtx.stopped) return;
+  const body = JSON.stringify({
+    messages: [{
+      topic,
+      seqId,
+      fromUid: fromUid || '',
+      content,
+      timestamp: new Date().toISOString(),
+      direction: 'outbound' as const,
+    }],
+  });
+  fetch(`${accountCtx.humanApiUrl}/agent/messages/sync`, {
+    method: 'POST',
+    headers: {
+      'Authorization': `Basic ${accountCtx.heartbeatAuth}`,
+      'Content-Type': 'application/json',
+    },
+    body,
+    signal: AbortSignal.timeout(5_000),
+  }).then(res => {
+    if (res.ok) {
+      accountCtx.log?.debug?.(`[imclaw] reply notification sent: topic=${topic} seq=${seqId}`);
+    } else {
+      accountCtx.log?.warn?.(`[imclaw] reply notification failed: ${res.status}`);
+    }
+  }).catch(() => { /* fire-and-forget */ });
+}
+
 // ─── Reusable message handler ───
 
 function extractTrustedHosts(...urls: (string | undefined)[]): string[] {
@@ -536,8 +578,11 @@ function registerMessageHandler(
                   }
 
                   const MAX_CHUNK = 4000;
+                  const actx = findAccountContext(routeAccountId);
+                  const selfUid = bridge.getSelfUid?.();
                   if (replyText.length <= MAX_CHUNK) {
-                    await bridge.sendMessage(msg.topic, replyText);
+                    const seqId = await bridge.sendMessage(msg.topic, replyText);
+                    notifyReplyDelivered(actx, msg.topic, seqId, selfUid, replyText);
                   } else {
                     const chunks: string[] = [];
                     let remaining = replyText;
@@ -553,7 +598,8 @@ function registerMessageHandler(
                       remaining = remaining.slice(splitAt).trimStart();
                     }
                     for (const chunk of chunks) {
-                      await bridge.sendMessage(msg.topic, chunk);
+                      const seqId = await bridge.sendMessage(msg.topic, chunk);
+                      notifyReplyDelivered(actx, msg.topic, seqId, selfUid, chunk);
                     }
                   }
                   log?.info?.(`[imclaw] → ${msg.topic} reply ${replyText.length} chars`);
@@ -590,9 +636,15 @@ function registerMessageHandler(
       ? `${baseSessionKey}:${existingSuffix}`
       : baseSessionKey;
 
+    const DISPATCH_TIMEOUT_MS = 120_000; // 2 minutes
     try {
       log?.info?.(`[imclaw-channel] dispatching to runtime: text="${(text || '').substring(0, 80)}" mediaUrl=${mediaUrl || 'none'}`);
-      await doDispatch(initialSessionKey);
+      await Promise.race([
+        doDispatch(initialSessionKey),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error(`dispatch timed out after ${DISPATCH_TIMEOUT_MS}ms`)), DISPATCH_TIMEOUT_MS),
+        ),
+      ]);
     } catch (err: any) {
       // Detect thinking block error from thrown exception
       if (isThinkingBlockError(err.message || '')) {
@@ -957,6 +1009,9 @@ export const imclawPlugin = {
       const workspace = (cfg as any).agents?.defaults?.workspace
         || path.join(os.homedir(), '.openclaw', 'workspace');
       const mediaDir = path.join(workspace, 'imclaw-media');
+      fs.mkdirSync(workspace, { recursive: true });
+      fs.mkdirSync(path.join(workspace, '.openclaw'), { recursive: true });
+      fs.mkdirSync(mediaDir, { recursive: true });
 
       log?.info?.(`[imclaw] starting account ${accountId} → ${pc.serverUrl}`);
       let bridge = new ImclawBridge(bridgeConfig);
