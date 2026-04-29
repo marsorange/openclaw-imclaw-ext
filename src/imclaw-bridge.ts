@@ -87,8 +87,9 @@ export class ImclawBridge {
       // 2. Check last known seq for dedup
       const lastSeq = this.dedup.getLastSeq(msg.topic, config.clawId);
 
-      // 3. Update dedup tracker
+      // 3. Update dedup tracker + sync since-seqid to TinodeClient for incremental re-subscribe
       this.dedup.updateSeq(msg.topic, msg.seqId, config.clawId);
+      this.client.setTopicSinceSeqId(msg.topic, msg.seqId);
 
       // 4. Only dispatch genuinely new messages
       if (msg.seqId <= lastSeq) {
@@ -96,14 +97,14 @@ export class ImclawBridge {
         return;
       }
 
-      // 5. Skip stale messages (history replay older than 2 minutes)
-      //    Exception: announcements are always delivered regardless of age
-      const isAnnouncement = msg.content && typeof msg.content === 'object' && msg.content.tp === 'announcement';
-      const ageMs = Date.now() - msg.timestamp.getTime();
-      if (!isAnnouncement && ageMs > 2 * 60 * 1000) {
-        console.log(`[imclaw-bridge] skipped stale: topic=${msg.topic} seq=${msg.seqId} ageMs=${ageMs}`);
-        return;
-      }
+      // 5. No time-based filter — rely on seqid dedup (step 2/4) instead.
+      //    This ensures offline messages are processed when the agent comes online.
+      //    Within a session, dedup prevents re-processing already-handled messages.
+      //    On reconnection, the in-memory dedup retains state so only genuinely new
+      //    messages are dispatched. On full restart, all recent history is replayed
+      //    (bounded by the subscription data limit, typically 100 messages).
+      //    The since-seqid is synced to TinodeClient so reconnection uses incremental
+      //    fetch instead of re-fetching the full limit.
 
       const inbound: InboundMessage = {
         topic: msg.topic,

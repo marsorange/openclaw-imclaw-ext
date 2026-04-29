@@ -28,6 +28,8 @@ export class TinodeClient extends EventEmitter {
   private heartbeatInterval: NodeJS.Timeout | null = null;
   private subscribedTopics = new Set<string>();
   private topicLimits = new Map<string, number>();
+  /** Tracks last processed seqid per topic for incremental history fetching */
+  private topicSinceSeqIds = new Map<string, number>();
   /** Maps requested topic name → resolved topic name (e.g. "usrXXXX" → "p2pXXXXYYYY") */
   private resolvedTopics = new Map<string, string>();
   /** Maps peer UID → display name (from {meta} sub public.fn) */
@@ -63,6 +65,14 @@ export class TinodeClient extends EventEmitter {
 
   setTopicLimit(topic: string, limit: number): void {
     this.topicLimits.set(topic, limit);
+  }
+
+  /**
+   * Track the last processed seqid for a topic. On re-subscribe, the client
+   * will pass this as `data.since` so only messages after this seqid are fetched.
+   */
+  setTopicSinceSeqId(topic: string, seqId: number): void {
+    this.topicSinceSeqIds.set(topic, seqId);
   }
 
   async connect(): Promise<void> {
@@ -248,12 +258,15 @@ export class TinodeClient extends EventEmitter {
       }, 10000);
 
       this.ws?.addEventListener('message', handler);
-      const dataLimit = this.topicLimits.get(topicName) || 24;
+      const dataLimit = this.topicLimits.get(topicName) || 100;
+      const sinceSeqId = this.topicSinceSeqIds.get(topicName);
+      const dataQuery: { limit: number; since?: number } = { limit: dataLimit };
+      if (sinceSeqId) dataQuery.since = sinceSeqId;
       this.send({
         sub: {
           id,
           topic: topicName,
-          get: { what: 'desc sub data', data: { limit: dataLimit } },
+          get: { what: 'desc sub data', data: dataQuery },
         }
       });
     });

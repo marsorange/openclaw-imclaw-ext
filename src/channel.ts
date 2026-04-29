@@ -486,9 +486,11 @@ function registerMessageHandler(
     // If this session was previously corrupted (within TTL), use the rotated suffix
     const existingSuffix = getCorruptedSuffix(baseSessionKey);
 
+    // Resolve owner UID once — used for approval shortcuts and sender role
+    const ownerUid = accounts.get(routeAccountId)?.ownerTinodeUid;
+
     // Natural-language approval shortcuts:
     // "确认/同意/拒绝" → "/approve <id> <decision>" when a pending approval exists.
-    const ownerUid = accounts.get(routeAccountId)?.ownerTinodeUid;
     const isOwnerDirectMessage = !isGroup && (!ownerUid || ownerUid === msg.from);
     if (text && isOwnerDirectMessage) {
       const pending = getPendingApproval(approvalStateKey);
@@ -506,6 +508,16 @@ function registerMessageHandler(
 
     let thinkingErrorDetected = false;
 
+    // Resolve sender role so the agent knows who it's talking to
+    const resolveSenderRole = (): string => {
+      if (!isGroup) {
+        return (!ownerUid || ownerUid === msg.from) ? 'owner' : 'peer';
+      }
+      // Group: owner is still owner; everyone else is a group member
+      return (ownerUid && ownerUid === msg.from) ? 'owner' : 'group_member';
+    };
+    const senderRole = resolveSenderRole();
+
     const doDispatch = async (sessionKey: string) => {
       thinkingErrorDetected = false;
 
@@ -522,6 +534,7 @@ function registerMessageHandler(
         ChatType: isGroup ? 'group' : 'direct',
         SenderName: bridge.getPeerName(msg.from) || msg.from,
         SenderId: msg.from,
+        SenderRole: senderRole,
         Provider: 'imclaw',
         Surface: 'imclaw',
         ConversationLabel: isGroup ? msg.topic : msg.from,
