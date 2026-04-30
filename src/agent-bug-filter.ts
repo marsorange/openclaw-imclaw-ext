@@ -14,6 +14,19 @@ const HARD_BLOCK_PATTERNS = [
   /计费资源已耗尽|资源包余量已用尽|免费资源包余量已用尽/i,
   /OAuth token refresh failed/i,
   /Agent failed before reply/i,
+  /context[_\s-]?limit[_\s-]?exceeded/i,
+  /context[_\s-]?overflow/i,
+  /prompt too (?:large|long) for/i,
+  /token[_\s-]?limit[_\s-]?(?:exceeded|reached)/i,
+  /max(?:imum)?[_\s-]?(?:context|token).*(?:exceeded|reached|limit)/i,
+  /compaction[_\s-]?(?:buffer|reserve)/i,
+  /reserveTokensFloor/i,
+  /try\s*\/(?:reset|new)/i,
+  /increase.*compaction/i,
+  /start\s*(?:a\s*)?fresh\s*(?:session|conversation)/i,
+  /reset.*(?:our|this)\s*(?:conversation|session)/i,
+  /this model.*maximum context length/i,
+  /⚠️\s*context/i,
 ];
 
 const PROVIDER_CODE_PATTERNS = [
