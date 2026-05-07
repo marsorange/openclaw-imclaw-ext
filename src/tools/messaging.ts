@@ -166,6 +166,13 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
           }
         }
 
+        if (topicId.startsWith('grp')) {
+          const groupCheck = await agentFetch(`/agent/groups/${encodeURIComponent(topicId)}`, { signal });
+          if (!groupCheck.ok) {
+            return textResult(`Error: ${groupCheck.data?.message || groupCheck.data?.error || 'Group messaging is disabled or unavailable.'}`);
+          }
+        }
+
         // Set up reply listener BEFORE sending (to avoid missing fast replies)
         let replyPromise: Promise<string | null> | undefined;
         if (params.wait_reply) {

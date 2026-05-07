@@ -84,6 +84,19 @@ function findAccountContext(accountId?: string | null): AccountContext | undefin
   return accounts.values().next().value as AccountContext | undefined;
 }
 
+async function assertGroupFeatureEnabledForTarget(actx: AccountContext, target: string): Promise<void> {
+  if (!target.startsWith('grp')) return;
+  const res = await fetch(`${actx.humanApiUrl}/agent/settings`, {
+    headers: { 'Authorization': `Basic ${actx.heartbeatAuth}` },
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!res.ok) throw new Error('IMClaw groups feature is unavailable.');
+  const data = await res.json() as any;
+  if (data?.groups_enabled === false) {
+    throw new Error('IMClaw groups feature is disabled by owner settings.');
+  }
+}
+
 // ─── Helpers to resolve plugin config from either location ───
 
 /**
@@ -408,6 +421,27 @@ function registerMessageHandler(
   trustedHosts?: string[],
 ): void {
   const rt = getPluginRuntime();
+  let groupFeatureCache: { enabled: boolean; fetchedAt: number } | null = null;
+
+  const isGroupFeatureEnabled = async (): Promise<boolean> => {
+    if (groupFeatureCache && !groupFeatureCache.enabled && Date.now() - groupFeatureCache.fetchedAt <= 30_000) {
+      return groupFeatureCache.enabled;
+    }
+    const actx = findAccountContext(accountId);
+    if (!actx) return false;
+    try {
+      const res = await fetch(`${actx.humanApiUrl}/agent/settings`, {
+        headers: { 'Authorization': `Basic ${actx.heartbeatAuth}` },
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (!res.ok) return false;
+      const data = await res.json() as any;
+      groupFeatureCache = { enabled: data?.groups_enabled !== false, fetchedAt: Date.now() };
+      return groupFeatureCache.enabled;
+    } catch {
+      return false;
+    }
+  };
 
   bridge.onMessage(async (msg) => {
     const contentPreview = typeof msg.content === 'string'
@@ -475,6 +509,10 @@ function registerMessageHandler(
     }
 
     const isGroup = msg.topic.startsWith('grp');
+    if (isGroup && !(await isGroupFeatureEnabled())) {
+      log?.info?.(`[imclaw-channel] ignored group message because groups are disabled: topic=${msg.topic}`);
+      return;
+    }
     const peerId = isGroup ? msg.topic : msg.from;
 
     // Resolve agent route via OpenClaw's standard routing system.
@@ -853,6 +891,7 @@ export const imclawPlugin = {
       const accountId = ctx.accountId || DEFAULT_ACCOUNT_ID;
       const actx = accounts.get(accountId);
       if (!actx) throw new Error(`imclaw: account ${accountId} not connected`);
+      await assertGroupFeatureEnabledForTarget(actx, ctx.to);
       await actx.bridge.sendMessage(ctx.to, ctx.text);
       return { channel: 'imclaw' as const, messageId: `imclaw-${Date.now()}` };
     },
@@ -861,6 +900,7 @@ export const imclawPlugin = {
       const accountId = ctx.accountId || DEFAULT_ACCOUNT_ID;
       const actx = accounts.get(accountId);
       if (!actx) throw new Error(`imclaw: account ${accountId} not connected`);
+      await assertGroupFeatureEnabledForTarget(actx, ctx.to);
 
       if (ctx.mediaUrl) {
         // Use OpenClaw's standard media loading (same as WhatsApp/Telegram outbound)
@@ -1301,19 +1341,34 @@ export const imclawPlugin = {
       }
 
       // Sync group and contact subscriptions on startup (parallel)
+      let startupGroupsEnabled = true;
+      try {
+        const settingsRes = await apiFetch('/agent/settings');
+        if (settingsRes?.ok) {
+          const settings = await settingsRes.json() as any;
+          startupGroupsEnabled = settings?.groups_enabled !== false;
+        }
+      } catch {
+        startupGroupsEnabled = true;
+      }
       if (!ctx.stopped) {
-        await Promise.allSettled([
-          apiFetch('/agent/groups/sync', { method: 'POST' })
-            .then(r => r ? log?.info?.('[imclaw] group subscriptions synced') : undefined)
-            .catch(() => log?.warn?.('[imclaw] group sync failed (non-critical)')),
+        const startupSyncs: Promise<unknown>[] = [
           apiFetch('/agent/contacts/sync', { method: 'POST' })
-            .then(r => r ? log?.info?.('[imclaw] contact subscriptions synced') : undefined)
+            .then(r => r?.ok ? log?.info?.('[imclaw] contact subscriptions synced') : undefined)
             .catch(() => log?.warn?.('[imclaw] contact sync failed (non-critical)')),
-        ]);
+        ];
+        if (startupGroupsEnabled) {
+          startupSyncs.push(
+            apiFetch('/agent/groups/sync', { method: 'POST' })
+              .then(r => r?.ok ? log?.info?.('[imclaw] group subscriptions synced') : undefined)
+              .catch(() => log?.warn?.('[imclaw] group sync failed (non-critical)')),
+          );
+        }
+        await Promise.allSettled(startupSyncs);
       }
 
       // Fetch group list and apply per-group message limits
-      if (!ctx.stopped) {
+      if (!ctx.stopped && startupGroupsEnabled) {
       try {
         const groupsRes = await apiFetch('/agent/groups');
         if (groupsRes?.ok) {
@@ -1334,7 +1389,22 @@ export const imclawPlugin = {
       const heartbeatUrl = `${pc.humanApiUrl}/agent/heartbeat`;
       let refreshingCreds = false;
       const sendHeartbeat = async () => {
-        if (ctx.stopped || ctx.authPaused) return;
+        if (ctx.stopped) return;
+        if (ctx.authPaused) {
+          if (!refreshingCreds) {
+            refreshingCreds = true;
+            try {
+              const recovered = await reconnectWithReplacementConnectKey();
+              if (!recovered && !ctx.stopped) await cleanup();
+            } catch (err: any) {
+              log?.error?.(`[imclaw] paused auth recovery failed: ${err.message}`);
+              if (!ctx.stopped) await cleanup();
+            } finally {
+              refreshingCreds = false;
+            }
+          }
+          return;
+        }
         try {
           const res = await fetch(heartbeatUrl, {
             method: 'POST',
@@ -1573,22 +1643,59 @@ export const imclawPlugin = {
       };
 
       // Owner feature toggles for autonomous social behaviors.
-      const getAutonomyFeatureSettings = async (): Promise<{
-        momentsAutopilotEnabled: boolean;
-        plazaAutopilotEnabled: boolean;
+      let cachedFeatureSettings: {
+        momentsEnabled: boolean;
+        momentsEnabledAt: number | null;
+        plazaEnabled: boolean;
+        plazaEnabledAt: number | null;
+        fetchedAt: number;
+      } | null = null;
+      const FEATURE_SETTINGS_CACHE_TTL = 5 * 60_000;
+
+      const parseSettingTime = (value: unknown): number | null => {
+        if (!value) return null;
+        const ts = new Date(String(value)).getTime();
+        return Number.isFinite(ts) ? ts : null;
+      };
+
+      const getFeatureSettings = async (): Promise<{
+        momentsEnabled: boolean;
+        momentsEnabledAt: number | null;
+        plazaEnabled: boolean;
+        plazaEnabledAt: number | null;
       }> => {
         try {
           const res = await apiFetch('/agent/settings');
           if (!res || !res.ok) {
-            return { momentsAutopilotEnabled: true, plazaAutopilotEnabled: true };
+            const cached = cachedFeatureSettings && (Date.now() - cachedFeatureSettings.fetchedAt <= FEATURE_SETTINGS_CACHE_TTL)
+              ? cachedFeatureSettings
+              : null;
+            return cached ?? {
+              momentsEnabled: false,
+              momentsEnabledAt: null,
+              plazaEnabled: false,
+              plazaEnabledAt: null,
+            };
           }
           const data = await res.json() as any;
-          return {
-            momentsAutopilotEnabled: data?.moments_autopilot_enabled !== false,
-            plazaAutopilotEnabled: data?.plaza_autopilot_enabled !== false,
+          cachedFeatureSettings = {
+            momentsEnabled: data?.moments_enabled === true,
+            momentsEnabledAt: parseSettingTime(data?.moments_enabled_at),
+            plazaEnabled: data?.plaza_enabled === true,
+            plazaEnabledAt: parseSettingTime(data?.plaza_enabled_at),
+            fetchedAt: Date.now(),
           };
+          return cachedFeatureSettings;
         } catch {
-          return { momentsAutopilotEnabled: true, plazaAutopilotEnabled: true };
+          const cached = cachedFeatureSettings && (Date.now() - cachedFeatureSettings.fetchedAt <= FEATURE_SETTINGS_CACHE_TTL)
+            ? cachedFeatureSettings
+            : null;
+          return cached ?? {
+            momentsEnabled: false,
+            momentsEnabledAt: null,
+            plazaEnabled: false,
+            plazaEnabledAt: null,
+          };
         }
       };
 
@@ -1596,20 +1703,27 @@ export const imclawPlugin = {
       const runMomentsCheck = async () => {
         if (ctx.stopped) return;
         try {
-          const settings = await getAutonomyFeatureSettings();
-          if (!settings.momentsAutopilotEnabled) {
+          const settings = await getFeatureSettings();
+          if (!settings.momentsEnabled) {
             log?.info?.('[imclaw-moments] disabled by owner settings');
+            return;
+          }
+          if (settings.momentsEnabledAt && Date.now() - settings.momentsEnabledAt < 60 * 60_000) {
+            log?.info?.('[imclaw-moments] recently enabled; waiting before autopilot post check');
             return;
           }
 
           const mineRes = await apiFetch('/agent/moments/mine?limit=20');
-          if (!mineRes) return;
-          const myMoments = mineRes.ok ? (await mineRes.json() as any[]) : [];
-          const latest = myMoments[0] || null;
+          if (!mineRes || !mineRes.ok) return;
+          const myMoments = await mineRes.json() as any[];
+          const eligibleMoments = settings.momentsEnabledAt
+            ? myMoments.filter((m: any) => new Date(m.created_at).getTime() >= settings.momentsEnabledAt!)
+            : myMoments;
+          const latest = eligibleMoments[0] || null;
           const lastAt = latest?.created_at ? new Date(latest.created_at).getTime() : 0;
           const hoursSince = lastAt > 0 ? ((Date.now() - lastAt) / 3600_000).toFixed(1) : 'never';
           const now = Date.now();
-          const last24hCount = myMoments.filter((m: any) => {
+          const last24hCount = eligibleMoments.filter((m: any) => {
             const ts = new Date(m.created_at).getTime();
             return Number.isFinite(ts) && (now - ts) <= 24 * 3600_000;
           }).length;
@@ -1696,9 +1810,13 @@ export const imclawPlugin = {
       // Discovery: fetch available topics → present each to agent → join + post if agent replies
       const runDiscovery = async () => {
         if (ctx.stopped) return;
-        const settings = await getAutonomyFeatureSettings();
-        if (!settings.plazaAutopilotEnabled) {
+        const settings = await getFeatureSettings();
+        if (!settings.plazaEnabled) {
           log?.info?.('[imclaw-plaza] discovery disabled by owner settings');
+          return;
+        }
+        if (settings.plazaEnabledAt && Date.now() - settings.plazaEnabledAt < 30 * 60_000) {
+          log?.info?.('[imclaw-plaza] recently enabled; waiting before discovery');
           return;
         }
         reportPlazaActivity('discovery_start');
@@ -1876,9 +1994,13 @@ export const imclawPlugin = {
       const runPoll = async () => {
         if (ctx.stopped) return;
         try {
-          const settings = await getAutonomyFeatureSettings();
-          if (!settings.plazaAutopilotEnabled) {
+          const settings = await getFeatureSettings();
+          if (!settings.plazaEnabled) {
             log?.info?.('[imclaw-plaza] poll disabled by owner settings');
+            return;
+          }
+          if (settings.plazaEnabledAt && Date.now() - settings.plazaEnabledAt < 30 * 60_000) {
+            log?.info?.('[imclaw-plaza] recently enabled; skipping first poll window');
             return;
           }
 
@@ -1888,7 +2010,13 @@ export const imclawPlugin = {
 
           for (const topic of myTopics) {
             if (ctx.stopped) return;
-            const since = topic.my_last_message_at || topic.created_at;
+            const topicSince = new Date(topic.my_last_message_at || topic.created_at).getTime();
+            const sinceTs = settings.plazaEnabledAt
+              ? Math.max(Number.isFinite(topicSince) ? topicSince : 0, settings.plazaEnabledAt)
+              : topicSince;
+            const since = Number.isFinite(sinceTs) && sinceTs > 0
+              ? new Date(sinceTs).toISOString()
+              : (topic.my_last_message_at || topic.created_at);
             const msgsRes = await apiFetch(
               `/agent/plaza/topics/${topic.id}/messages?since=${encodeURIComponent(since)}&limit=20`,
             );
@@ -2157,7 +2285,32 @@ export function getOwnerTinodeUid(accountId?: string): string | null {
 export function getAccountAuth(accountId?: string | null): { auth: string; humanApiUrl: string } | null {
   const ctx = findAccountContext(accountId);
   if (!ctx) return null;
+  if (ctx.stopped || ctx.authPaused) return null;
   return { auth: ctx.heartbeatAuth, humanApiUrl: ctx.humanApiUrl };
+}
+
+/**
+ * Whether an account exists but is intentionally paused due to invalidated
+ * credentials. Tool calls must not fall back to stale cached credentials in
+ * this state.
+ */
+export function isAccountAuthPaused(accountId?: string | null): boolean {
+  const ctx = findAccountContext(accountId);
+  return !!ctx && (ctx.stopped || ctx.authPaused);
+}
+
+/**
+ * Pause an account after an Agent API call proves credentials are invalid.
+ * Heartbeat/reconnect logic will wait for a replacement connect key.
+ */
+export function pauseAccountAuth(accountId?: string | null, reason?: string): void {
+  const ctx = findAccountContext(accountId);
+  if (!ctx || ctx.authPaused || ctx.stopped) return;
+  ctx.authPaused = true;
+  ctx.log?.error?.(`[imclaw] account auth paused${reason ? `: ${reason}` : ''}`);
+  try {
+    void ctx.bridge.stop();
+  } catch { /* ignore */ }
 }
 
 /**

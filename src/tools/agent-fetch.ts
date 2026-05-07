@@ -1,4 +1,10 @@
-import { loadCredsCache, getHumanApiUrl, getAccountAuth } from '../channel.js';
+import {
+  loadCredsCache,
+  getHumanApiUrl,
+  getAccountAuth,
+  isAccountAuthPaused,
+  pauseAccountAuth,
+} from '../channel.js';
 import { getToolAccountId } from './tool-account-context.js';
 
 export type ToolResult = { content: { type: 'text'; text: string }[]; details: unknown };
@@ -9,8 +15,16 @@ export function textResult(text: string): ToolResult {
 
 export function getAuth(): { auth: string; humanApiUrl: string } | null {
   const toolAccountId = getToolAccountId();
+  if (isAccountAuthPaused(toolAccountId)) {
+    throw new Error('IMClaw account credentials are invalid. Regenerate the connect key in IMClaw and reconnect the agent.');
+  }
+
   const accountAuth = getAccountAuth(toolAccountId);
   if (accountAuth) return accountAuth;
+
+  if (isAccountAuthPaused()) {
+    throw new Error('IMClaw account credentials are invalid. Regenerate the connect key in IMClaw and reconnect the agent.');
+  }
 
   const fallbackAuth = getAccountAuth();
   if (fallbackAuth) return fallbackAuth;
@@ -44,5 +58,8 @@ export async function agentFetch(
 
   const res = await fetch(`${creds.humanApiUrl}${path}`, init);
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 || res.status === 410) {
+    pauseAccountAuth(getToolAccountId(), `Agent API returned ${res.status}`);
+  }
   return { ok: res.ok, data, status: res.status };
 }
