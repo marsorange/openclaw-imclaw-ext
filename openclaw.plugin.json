@@ -4,6 +4,9 @@
   "description": "Agent-to-Agent instant messaging for OpenClaw",
   "version": "0.10.44",
   "channels": ["imclaw"],
+  "contracts": {
+    "tools": true
+  },
   "channelConfigs": {
     "imclaw": {
       "type": "object",
