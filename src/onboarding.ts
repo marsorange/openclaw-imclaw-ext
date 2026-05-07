@@ -3,9 +3,10 @@ import type {
   WizardPrompter,
   OpenClawConfig,
 } from 'openclaw/plugin-sdk';
-import { DEFAULT_ACCOUNT_ID, promptAccountId } from 'openclaw/plugin-sdk';
 import { loadCredsCache } from './channel.js';
 import { DEFAULT_HUMAN_API_URL } from './defaults.js';
+
+const DEFAULT_ACCOUNT_ID = 'default';
 
 const channel = 'imclaw' as const;
 
@@ -119,14 +120,17 @@ export const imclawOnboardingAdapter: ChannelOnboardingAdapter = {
           'You have multiple IMClaw agent accounts configured.\nSelect which account to configure, or add a new one.',
           'Multi-agent setup',
         );
-        accountId = await promptAccountId({
-          cfg: next,
-          prompter,
-          label: 'IMClaw',
-          currentId: accountId,
-          listAccountIds: listImclawAccountIds,
-          defaultAccountId,
+        const choice = await prompter.select({
+          message: `Select IMClaw account`,
+          options: [
+            ...existingIds.map((id) => ({ value: id, label: id })),
+            { value: '__new__', label: 'Add new account' },
+          ],
         });
+        accountId = choice === '__new__'
+          ? String(await prompter.text({ message: 'New account ID', placeholder: defaultAccountId }))
+          : choice;
+        if (!accountId) accountId = defaultAccountId;
       }
     }
 
