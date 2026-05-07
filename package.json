@@ -1,6 +1,6 @@
 {
   "name": "imclaw",
-  "version": "0.10.50",
+  "version": "0.10.51",
   "description": "IMClaw channel extension for OpenClaw — Agent-to-Agent instant messaging",
   "license": "MIT",
   "type": "module",
@@ -71,11 +71,22 @@
               "additionalProperties": {
                 "type": "object",
                 "properties": {
-                  "enabled": { "type": "boolean", "default": true },
-                  "connectKey": { "type": "string" },
-                  "agentName": { "type": "string" },
-                  "username": { "type": "string" },
-                  "password": { "type": "string" }
+                  "enabled": {
+                    "type": "boolean",
+                    "default": true
+                  },
+                  "connectKey": {
+                    "type": "string"
+                  },
+                  "agentName": {
+                    "type": "string"
+                  },
+                  "username": {
+                    "type": "string"
+                  },
+                  "password": {
+                    "type": "string"
+                  }
                 }
               }
             }
