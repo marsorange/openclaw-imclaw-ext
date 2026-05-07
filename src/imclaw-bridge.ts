@@ -1,8 +1,21 @@
+import fs from 'fs';
+import path from 'path';
+import os from 'os';
 import { TinodeClient, TinodeMessage, TinodeClientOptions } from './tinode-client.js';
 
-/** In-memory dedup store — tracks last seq per topic for duplicate detection */
+const DEDUP_STATE_DIR = path.join(os.homedir(), '.openclaw', 'imclaw');
+const DEDUP_STATE_PATH = path.join(DEDUP_STATE_DIR, 'dedup-state.json');
+
+/** Persisted dedup store — tracks last seq per topic for duplicate detection, survives restarts */
 class MessageDedup {
   private seqs = new Map<string, number>();
+  private dirty = false;
+  private flushTimer: NodeJS.Timeout | null = null;
+
+  constructor() {
+    this.load();
+  }
+
   private scopedTopic(topic: string, ownerClawId?: string): string {
     return ownerClawId ? `${ownerClawId}::${topic}` : topic;
   }
@@ -12,7 +25,56 @@ class MessageDedup {
   updateSeq(topic: string, seqId: number, ownerClawId?: string): void {
     const key = this.scopedTopic(topic, ownerClawId);
     const cur = this.seqs.get(key) ?? 0;
-    if (seqId > cur) this.seqs.set(key, seqId);
+    if (seqId > cur) {
+      this.seqs.set(key, seqId);
+      this.dirty = true;
+      this.scheduleFlush();
+    }
+  }
+
+  /** Get all stored seq IDs (for restoring TinodeClient since-seq on startup) */
+  getAllSeqs(ownerClawId?: string): Map<string, number> {
+    const result = new Map<string, number>();
+    const prefix = ownerClawId ? `${ownerClawId}::` : '';
+    for (const [key, seq] of this.seqs) {
+      if (ownerClawId ? key.startsWith(prefix) : !key.includes('::')) {
+        const topic = ownerClawId ? key.slice(prefix.length) : key;
+        result.set(topic, seq);
+      }
+    }
+    return result;
+  }
+
+  private load(): void {
+    try {
+      if (fs.existsSync(DEDUP_STATE_PATH)) {
+        const data = JSON.parse(fs.readFileSync(DEDUP_STATE_PATH, 'utf-8'));
+        if (data && typeof data === 'object') {
+          for (const [key, val] of Object.entries(data)) {
+            if (typeof val === 'number') this.seqs.set(key, val);
+          }
+        }
+      }
+    } catch { /* ignore — start fresh */ }
+  }
+
+  private scheduleFlush(): void {
+    if (this.flushTimer) return;
+    this.flushTimer = setTimeout(() => {
+      this.flushTimer = null;
+      this.flush();
+    }, 5_000);
+  }
+
+  flush(): void {
+    if (!this.dirty) return;
+    try {
+      fs.mkdirSync(DEDUP_STATE_DIR, { recursive: true });
+      const obj: Record<string, number> = {};
+      for (const [key, val] of this.seqs) obj[key] = val;
+      fs.writeFileSync(DEDUP_STATE_PATH, JSON.stringify(obj), { mode: 0o600 });
+      this.dirty = false;
+    } catch { /* ignore — best effort persistence */ }
   }
 }
 
@@ -162,6 +224,14 @@ export class ImclawBridge {
   }
 
   async start(): Promise<void> {
+    // Restore persisted seq IDs so Tinode skips already-processed messages on subscribe
+    const savedSeqs = this.dedup.getAllSeqs(this.config.clawId);
+    for (const [topic, seqId] of savedSeqs) {
+      this.client.setTopicSinceSeqId(topic, seqId);
+    }
+    if (savedSeqs.size > 0) {
+      console.log(`[imclaw-bridge] restored ${savedSeqs.size} topic seq IDs from disk`);
+    }
     await this.client.connect();
     console.log('IMClaw: connected to Tinode');
   }
@@ -256,6 +326,7 @@ export class ImclawBridge {
   }
 
   async stop(): Promise<void> {
+    this.dedup.flush();
     this.client.disconnect();
   }
 }

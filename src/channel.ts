@@ -268,6 +268,32 @@ function setCorruptedSuffix(baseKey: string, suffix: string): void {
   corruptedSessionKeys.set(baseKey, { suffix, expiry: Date.now() + SESSION_KEY_TTL });
 }
 
+// ─── Spam repetition detection ───
+
+/**
+ * Detect if a message is just a short phrase repeated many times.
+ * e.g. "好的。好的。好的..." or "是的 是的 是的..."
+ */
+function isSpamRepetition(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length < 10 || trimmed.length > 2000) return false;
+
+  // Try common delimiters
+  for (const sep of ['。', '，', '！', '？', '、', ' ', '\n']) {
+    const parts = trimmed.split(sep).filter(Boolean);
+    if (parts.length < 5) continue;
+    // Check if >80% of parts are the same string
+    const counts = new Map<string, number>();
+    for (const p of parts) {
+      const k = p.trim();
+      if (k) counts.set(k, (counts.get(k) || 0) + 1);
+    }
+    const maxCount = Math.max(...counts.values());
+    if (maxCount / parts.length >= 0.8) return true;
+  }
+  return false;
+}
+
 // ─── Approval shortcut bridging ───
 
 type PendingApprovalState = {
@@ -420,6 +446,13 @@ function registerMessageHandler(
     // Prevents agents from receiving and replying to error messages, which causes error loops.
     if (text && shouldSuppressAgentBugText(text)) {
       log?.warn?.(`[imclaw-channel] suppressed inbound error message from ${msg.from}: ${text.substring(0, 120)}`);
+      return;
+    }
+
+    // Spam detection: skip messages that are just a short phrase repeated many times
+    // (e.g. "好的。好的。好的..." — agents shouldn't waste context on these)
+    if (text && isSpamRepetition(text)) {
+      log?.warn?.(`[imclaw-channel] suppressed spam repetition from ${msg.from}: ${text.substring(0, 80)}`);
       return;
     }
 
@@ -1912,13 +1945,13 @@ export const imclawPlugin = {
         }
       };
 
-      // Scheduling: first run shortly after startup, then recurring cycles
-      const PLAZA_DISCOVERY_CYCLE = 25 * 60_000;    // 25 min
-      const PLAZA_DISCOVERY_JITTER = 3 * 60_000;    // ±3 min jitter
-      const PLAZA_POLL_CYCLE = 10 * 60_000;         // 10 min
-      const PLAZA_POLL_JITTER = 2 * 60_000;         // ±2 min jitter
-      const MOMENTS_CYCLE = 2 * 3600_000;           // 2h
-      const MOMENTS_JITTER = 15 * 60_000;           // ±15 min
+      // Scheduling: low-frequency cycles to avoid context pressure
+      const PLAZA_DISCOVERY_CYCLE = 12 * 3600_000;  // 12h
+      const PLAZA_DISCOVERY_JITTER = 30 * 60_000;   // ±30 min jitter
+      const PLAZA_POLL_CYCLE = 12 * 3600_000;       // 12h
+      const PLAZA_POLL_JITTER = 30 * 60_000;        // ±30 min jitter
+      const MOMENTS_CYCLE = 24 * 3600_000;          // 24h (once per day)
+      const MOMENTS_JITTER = 60 * 60_000;           // ±1h jitter
 
       const scheduleDiscovery = (delay: number) => {
         return setTimeout(async () => {
@@ -1948,10 +1981,10 @@ export const imclawPlugin = {
         }, delay);
       };
 
-      // First discovery 15s after connect, first poll 45s after connect
-      ctx.plazaDiscoveryTimer = scheduleDiscovery(15_000);
-      ctx.plazaPollTimer = schedulePoll(45_000);
-      ctx.momentsTimer = scheduleMoments(90_000);
+      // First discovery 5min after connect, first poll 10min, first moments 15min
+      ctx.plazaDiscoveryTimer = scheduleDiscovery(5 * 60_000);
+      ctx.plazaPollTimer = schedulePoll(10 * 60_000);
+      ctx.momentsTimer = scheduleMoments(15 * 60_000);
 
       // Keep alive until abort — cleanup reads ctx so reconnect swaps are reflected
       // Handle already-aborted signal (e.g. abort fired during startup sync)
