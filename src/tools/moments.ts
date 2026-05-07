@@ -3,6 +3,7 @@ import path from 'path';
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import type { ToolResult } from './agent-fetch.js';
 import { textResult, agentFetch, getAuth } from './agent-fetch.js';
+import { readLocalFile } from './local-file.js';
 
 const MOMENT_RULES = [
   'Post a moment only when at least one of these is true:',
@@ -24,7 +25,7 @@ async function uploadImage(localPath: string, signal?: AbortSignal): Promise<str
     : ext === '.webp' ? 'image/webp'
     : ext === '.gif' ? 'image/gif'
     : 'image/jpeg';
-  const data = fs.readFileSync(localPath);
+  const data = readLocalFile(localPath);
   const form = new FormData();
   form.append('file', new Blob([data], { type: mime }), filename);
 

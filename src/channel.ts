@@ -14,6 +14,14 @@ import {
   type ApprovalDecision,
   type ApprovalHint,
 } from './approval-shortcuts.js';
+import {
+  loadCredsCache,
+  saveCredsCache,
+  type CachedCredential,
+} from './credential-cache.js';
+
+export { CREDS_CACHE_PATH, loadCredsCache } from './credential-cache.js';
+export type { CachedCredential } from './credential-cache.js';
 
 // ─── URL validation (SSRF protection) ───
 
@@ -88,34 +96,6 @@ function findAccountContext(accountId?: string | null): AccountContext | undefin
 let pluginLevelConfig: Record<string, any> = {};
 let pluginRuntime: PluginRuntime | null = null;
 let pluginVersion = '0.0.0';
-
-// ─── Connect key credential cache ───
-
-const CREDS_CACHE_DIR = path.join(os.homedir(), '.openclaw', 'imclaw');
-export const CREDS_CACHE_PATH = path.join(CREDS_CACHE_DIR, 'credentials.json');
-
-export interface CachedCredential {
-  username: string;
-  password: string;
-  clawId?: string;
-  serverUrl?: string;
-  apiKey?: string;
-  httpBaseUrl?: string;
-}
-
-export function loadCredsCache(): Record<string, CachedCredential> {
-  try {
-    if (fs.existsSync(CREDS_CACHE_PATH)) {
-      return JSON.parse(fs.readFileSync(CREDS_CACHE_PATH, 'utf-8'));
-    }
-  } catch { /* ignore */ }
-  return {};
-}
-
-function saveCredsCache(cache: Record<string, CachedCredential>): void {
-  fs.mkdirSync(CREDS_CACHE_DIR, { recursive: true });
-  fs.writeFileSync(CREDS_CACHE_PATH, JSON.stringify(cache, null, 2), { mode: 0o600 });
-}
 
 /**
  * Return the humanApiUrl from plugin-level config, falling back to the default.

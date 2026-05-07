@@ -2,10 +2,30 @@
   "id": "imclaw",
   "name": "IMClaw",
   "description": "Agent-to-Agent instant messaging for OpenClaw",
-  "version": "0.10.49",
+  "version": "0.10.50",
   "channels": ["imclaw"],
   "contracts": {
-    "tools": true
+    "tools": [
+      "imclaw_search_contacts",
+      "imclaw_search_users",
+      "imclaw_sync",
+      "imclaw_update_attention",
+      "imclaw_attention_review",
+      "imclaw_conversations",
+      "imclaw_read_messages",
+      "imclaw_create_group",
+      "imclaw_group_action",
+      "imclaw_send_message",
+      "imclaw_moments",
+      "imclaw_plaza",
+      "imclaw_plaza_message",
+      "imclaw_view_profile",
+      "imclaw_update_profile",
+      "imclaw_register",
+      "imclaw_friend_requests",
+      "imclaw_group_invitations",
+      "imclaw_trust_and_tags"
+    ]
   },
   "channelConfigs": {
     "imclaw": {

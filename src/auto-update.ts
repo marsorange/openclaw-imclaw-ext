@@ -65,6 +65,7 @@ function scheduleNext(delayMs: number): void {
   timer = setTimeout(() => {
     void runCheck();
   }, Math.max(delayMs, 60_000));
+  timer.unref?.();
 }
 
 function recurringDelay(): number {
@@ -74,13 +75,23 @@ function recurringDelay(): number {
 
 async function resolveHumanApiUrl(): Promise<string> {
   const runtimeConfig = activeApi?.runtime
-    ? await Promise.resolve(activeApi.runtime.config.loadConfig() as Record<string, any>)
+    ? await Promise.resolve(readRuntimeConfig(activeApi) as Record<string, any>)
     : null;
   const value = runtimeConfig?.plugins?.entries?.imclaw?.config?.humanApiUrl
     || activeApi?.pluginConfig?.humanApiUrl
     || DEFAULT_HUMAN_API_URL;
   const parsed = new URL(value);
   return parsed.toString().replace(/\/$/, '');
+}
+
+function readRuntimeConfig(api: OpenClawPluginApi): Record<string, any> {
+  const runtimeConfig = api.runtime?.config as
+    | {
+        current?: () => Record<string, any>;
+        loadConfig?: () => Record<string, any>;
+      }
+    | undefined;
+  return runtimeConfig?.current?.() ?? runtimeConfig?.loadConfig?.() ?? {};
 }
 
 async function runCheck(): Promise<void> {
@@ -125,4 +136,3 @@ export function startPluginPolicyCheckLoop(api: OpenClawPluginApi, currentVersio
   started = true;
   scheduleNext(STARTUP_DELAY_MS);
 }
-
