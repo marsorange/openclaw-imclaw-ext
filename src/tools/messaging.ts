@@ -5,6 +5,7 @@ import { getFirstAccountId, getAccountBridge, getOwnerTinodeUid } from '../chann
 import type { InboundMessage } from '../imclaw-bridge.js';
 import type { ToolResult } from './agent-fetch.js';
 import { textResult, agentFetch } from './agent-fetch.js';
+import { readLocalFile } from './local-file.js';
 
 const MIME_MAP: Record<string, string> = {
   '.txt': 'text/plain', '.pdf': 'application/pdf', '.json': 'application/json',
@@ -219,7 +220,7 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
           if (!fs.existsSync(filePath)) {
             return textResult(`Error: File not found: ${filePath}`);
           }
-          const buffer = fs.readFileSync(filePath);
+          const buffer = readLocalFile(filePath);
           const filename = nodePath.basename(filePath);
           const ext = nodePath.extname(filePath).toLowerCase();
           const mime = MIME_MAP[ext] || 'application/octet-stream';

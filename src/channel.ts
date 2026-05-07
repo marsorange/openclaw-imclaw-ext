@@ -416,6 +416,13 @@ function registerMessageHandler(
       return;
     }
 
+    // Filter inbound error messages from other agents (context overflow, quota errors, etc.)
+    // Prevents agents from receiving and replying to error messages, which causes error loops.
+    if (text && shouldSuppressAgentBugText(text)) {
+      log?.warn?.(`[imclaw-channel] suppressed inbound error message from ${msg.from}: ${text.substring(0, 120)}`);
+      return;
+    }
+
     // Auto-download media to workspace
     let localMediaPath: string | undefined;
     if (mediaUrl) {
@@ -440,7 +447,7 @@ function registerMessageHandler(
     // Resolve agent route via OpenClaw's standard routing system.
     // This allows users to bind specific agents (including sub-agents) to
     // IMClaw via the `bindings` config in openclaw.yaml.
-    const currentCfg = await rt.config.loadConfig();
+    const currentCfg = (rt.config as any).current?.() ?? rt.config.loadConfig();
     const route = rt.channel.routing?.resolveAgentRoute?.({
       cfg: currentCfg,
       channel: 'imclaw',
@@ -957,7 +964,7 @@ export const imclawPlugin = {
         while (!abortSignal.aborted) {
           try {
             const rt = getPluginRuntime();
-            const currentCfg = await rt?.config.loadConfig() as Record<string, any> | undefined;
+            const currentCfg = (rt?.config as any)?.current?.() ?? rt?.config.loadConfig() as Record<string, any> | undefined;
             const currentAccount = currentCfg?.channels?.imclaw?.accounts?.[accountId];
             const nextKey = currentAccount?.connectKey as string | undefined;
             const agentName = (currentAccount?.agentName as string) || undefined;
@@ -1393,7 +1400,7 @@ export const imclawPlugin = {
           try {
             const rt = getPluginRuntime();
             if (rt) {
-              const currentCfg = await rt.config.loadConfig() as Record<string, any>;
+              const currentCfg = (rt.config as any).current?.() ?? rt.config.loadConfig() as Record<string, any>;
               const currentAccount = currentCfg?.channels?.imclaw?.accounts?.[accountId];
               const newConnectKey = currentAccount?.connectKey as string | undefined;
               if (newConnectKey && newConnectKey !== ctx.configConnectKey) {
@@ -1462,7 +1469,7 @@ export const imclawPlugin = {
       ): Promise<string | null> => {
         const rt = getPluginRuntime();
         if (!rt) return null;
-        const currentCfg = await rt.config.loadConfig();
+        const currentCfg = (rt.config as any).current?.() ?? rt.config.loadConfig();
 
         let collectedReply: string | null = null;
 

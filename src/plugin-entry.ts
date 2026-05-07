@@ -63,39 +63,74 @@ const plugin = {
 };
 
 /**
- * Auto-configure tools.profile to "full" when the plugin loads,
- * so imclaw tools (imclaw_send_message, etc.) are available to the agent.
- * Only patches if the current profile would block plugin tools.
+ * Ensure imclaw tools are accessible after installation.
+ *
+ * OpenClaw's tools.allow is a literal match list — "imclaw" does NOT match
+ * "imclaw_send_message" etc. The old code injected the bare string, which
+ * broke every tool call.
+ *
+ * Strategy:
+ *  1. If tools.allow is absent or tools.profile is "full" — nothing to do.
+ *  2. If tools.allow contains the bare "imclaw" entry — replace it with
+ *     the actual tool names declared in contracts.tools.
+ *  3. Otherwise — just warn.
  */
 function ensureToolsProfile(api: OpenClawPluginApi) {
   if (!api.runtime) return;
   try {
-    const cfg = api.config as Record<string, any>;
+    const cfg = ((api.runtime.config as any).current?.() ?? api.config) as Record<string, any>;
     const tools = cfg?.tools;
-    const profile = tools?.profile;
 
-    // "full" or unset means all tools are available — nothing to do
+    // Case 1: no restrictions — tools are available by default
+    if (!tools) return;
+    const profile = tools.profile;
     if (!profile || profile === 'full') return;
-
-    api.logger.info(
-      `[imclaw] tools.profile is "${profile}" — auto-upgrading to "full" so imclaw tools are available`,
-    );
-
-    const freshCfg = api.runtime.config.loadConfig() as Record<string, any>;
-    if (!freshCfg.tools || typeof freshCfg.tools !== 'object') {
-      freshCfg.tools = {};
+    if (!Array.isArray(tools.allow) || tools.allow.length === 0) {
+      // tools.profile is restrictive but no allowlist — just warn
+      api.logger.warn(
+        `[imclaw] tools.profile is "${profile}" — imclaw tools may not be available. Set tools.profile to "full" for full access.`,
+      );
+      return;
     }
-    freshCfg.tools.profile = 'full';
-    // Ensure imclaw is in the allow list if one exists
-    if (Array.isArray(freshCfg.tools.allow)) {
-      if (!freshCfg.tools.allow.includes('imclaw')) {
-        freshCfg.tools.allow.push('imclaw');
+
+    const allow: string[] = tools.allow;
+
+    // Case 2: allowlist exists but contains bare "imclaw" — fix it
+    const imclawIdx = allow.indexOf('imclaw');
+    if (imclawIdx !== -1) {
+      const declaredTools: string[] = manifest?.contracts?.tools;
+      if (Array.isArray(declaredTools) && declaredTools.length > 0) {
+        // Remove bare "imclaw" and splice in actual tool names
+        allow.splice(imclawIdx, 1, ...declaredTools);
+        api.logger.info(
+          `[imclaw] replaced bare "imclaw" in tools.allow with ${declaredTools.length} declared tool names`,
+        );
+      } else {
+        // No manifest data — just remove the bad entry
+        allow.splice(imclawIdx, 1);
+        api.logger.warn(
+          `[imclaw] removed non-matching "imclaw" from tools.allow — declare contracts.tools in manifest for auto-fix`,
+        );
       }
+
+      // Persist the fix
+      const freshCfg = (typeof (api.runtime.config as any).current === 'function')
+        ? (api.runtime.config as any).current()
+        : cfg;
+      (api.runtime.config as any).writeConfigFile(freshCfg).catch((err: any) => {
+        api.logger.warn(`[imclaw] failed to persist tools.allow fix: ${err?.message ?? err}`);
+      });
+      return;
     }
 
-    api.runtime.config.writeConfigFile(freshCfg as any).catch((err: any) => {
-      api.logger.warn(`[imclaw] failed to auto-configure tools.profile: ${err?.message ?? err}`);
-    });
+    // Case 3: allowlist exists without "imclaw" — check if any imclaw tool is listed
+    const hasImclawTool = allow.some((e: string) => e.startsWith('imclaw_'));
+    if (!hasImclawTool) {
+      api.logger.warn(
+        `[imclaw] tools.allow has no imclaw entries — plugin tools will be blocked. ` +
+        `Add imclaw tool names to tools.allow, or set tools.profile to "full".`,
+      );
+    }
   } catch {
     // Non-critical — user can always configure manually
   }
