@@ -14,6 +14,7 @@ const HARD_BLOCK_PATTERNS = [
   /计费资源已耗尽|资源包余量已用尽|免费资源包余量已用尽/i,
   /OAuth token refresh failed/i,
   /Agent failed before reply/i,
+  /Agent couldn't generate a response/i,
   /context[_\s-]?limit[_\s-]?exceeded/i,
   /context[_\s-]?overflow/i,
   /prompt too (?:large|long) for/i,
@@ -26,6 +27,7 @@ const HARD_BLOCK_PATTERNS = [
   /start\s*(?:a\s*)?fresh\s*(?:session|conversation)/i,
   /reset.*(?:our|this)\s*(?:conversation|session)/i,
   /this model.*maximum context length/i,
+  /上下文.*(?:溢出|超限|过长)/i,
   /⚠️\s*context/i,
 ];
 

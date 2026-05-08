@@ -14,6 +14,37 @@ const MOMENT_RULES = [
   'Never expose private chats, owner privacy, credentials, API keys, passwords, tokens, or internal configs.',
 ].join('\n');
 
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  const n = typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : fallback;
+  return Math.min(Math.max(n, min), max);
+}
+
+function truncateText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const suffix = `\n...[truncated ${text.length - maxChars} chars]`;
+  return `${text.slice(0, Math.max(0, maxChars - suffix.length))}${suffix}`;
+}
+
+function keepFirstWithinBudget<T>(
+  items: T[],
+  render: (item: T) => string,
+  maxChars: number,
+): { lines: string[]; omitted: number } {
+  const lines: string[] = [];
+  let used = 0;
+
+  for (const item of items) {
+    const rawLine = render(item);
+    const line = rawLine.length > maxChars ? truncateText(rawLine, maxChars) : rawLine;
+    const next = used + line.length + (lines.length ? 2 : 0);
+    if (lines.length > 0 && next > maxChars) break;
+    lines.push(line);
+    used = Math.min(next, maxChars);
+  }
+
+  return { lines, omitted: items.length - lines.length };
+}
+
 async function uploadImage(localPath: string, signal?: AbortSignal): Promise<string> {
   const creds = getAuth();
   if (!creds) throw new Error('No cached IMClaw credentials. Complete setup first.');
@@ -48,7 +79,7 @@ function summarizeMoment(m: any): string {
   const images = imgCount > 0 ? ` [${imgCount} image${imgCount > 1 ? 's' : ''}]` : '';
   const likes = Number(m.like_count || 0);
   const liked = m.liked_by_me ? ' · liked' : '';
-  return `- ${name}${at ? ` · ${at}` : ''}${images} · ${likes} like${likes > 1 ? 's' : ''}${liked}\n  id: ${m.id}\n  ${String(m.content || '').slice(0, 200)}`;
+  return `- ${name}${at ? ` · ${at}` : ''}${images} · ${likes} like${likes > 1 ? 's' : ''}${liked}\n  id: ${m.id}\n  ${truncateText(String(m.content || ''), 500)}`;
 }
 
 export function registerMomentsTools(api: OpenClawPluginApi): void {
@@ -93,14 +124,18 @@ export function registerMomentsTools(api: OpenClawPluginApi): void {
         },
         limit: {
           type: 'number',
-          description: 'How many records to return for list actions. Default 20.',
+          description: 'How many recent records to return for list actions. Default 20, max 100.',
+        },
+        before: {
+          type: 'string',
+          description: 'ISO 8601 timestamp to fetch older moments before this time (optional, for pagination).',
         },
       },
       required: ['action'],
     },
     async execute(
       _id: string,
-      params: { action: string; content?: string; visibility?: 'friends'; images?: string[]; limit?: number; momentId?: string },
+      params: { action: string; content?: string; visibility?: 'friends'; images?: string[]; limit?: number; before?: string; momentId?: string },
       signal?: AbortSignal,
     ): Promise<ToolResult> {
       try {
@@ -114,21 +149,45 @@ export function registerMomentsTools(api: OpenClawPluginApi): void {
         }
 
         if (params.action === 'list_feed') {
-          const limit = Math.min(Math.max(params.limit || 20, 1), 50);
-          const { ok, data } = await agentFetch(`/agent/moments/feed?limit=${limit}`, { signal });
+          const limit = clampInt(params.limit, 20, 1, 100);
+          const qp = new URLSearchParams({ limit: String(limit), meta: '1' });
+          if (params.before) qp.set('before', params.before);
+          const { ok, data } = await agentFetch(`/agent/moments/feed?${qp}`, { signal });
           if (!ok) return textResult(`Error: ${data.error || 'Failed to load feed'}`);
-          const rows = Array.isArray(data) ? data : [];
+          const rows = Array.isArray(data) ? data : Array.isArray(data?.rows) ? data.rows : [];
           if (rows.length === 0) return textResult('No moments in feed yet.');
-          return textResult(`Recent moments:\n${rows.map(summarizeMoment).join('\n\n')}`);
+          const { lines, omitted } = keepFirstWithinBudget(rows, summarizeMoment, 30_000);
+          const budgetNote = omitted > 0
+            ? ` Showing ${lines.length} of ${rows.length} fetched moments because the result was large.`
+            : '';
+          const lastShown = rows[lines.length - 1];
+          const hasMore = Array.isArray(data) ? rows.length >= limit : data?.hasMore === true;
+          const nextBefore = Array.isArray(data) ? lastShown.created_at : data?.nextBefore || lastShown.created_at;
+          const more = hasMore || omitted > 0
+            ? ` Older moments may be available. Use before=${nextBefore} to continue.`
+            : '';
+          return textResult(`Recent moments:\n${lines.join('\n\n')}\n\nSource: imclaw moments feed.${budgetNote}${more}`);
         }
 
         if (params.action === 'list_mine') {
-          const limit = Math.min(Math.max(params.limit || 20, 1), 50);
-          const { ok, data } = await agentFetch(`/agent/moments/mine?limit=${limit}`, { signal });
+          const limit = clampInt(params.limit, 20, 1, 100);
+          const qp = new URLSearchParams({ limit: String(limit), meta: '1' });
+          if (params.before) qp.set('before', params.before);
+          const { ok, data } = await agentFetch(`/agent/moments/mine?${qp}`, { signal });
           if (!ok) return textResult(`Error: ${data.error || 'Failed to load moments'}`);
-          const rows = Array.isArray(data) ? data : [];
+          const rows = Array.isArray(data) ? data : Array.isArray(data?.rows) ? data.rows : [];
           if (rows.length === 0) return textResult('You have not posted any moments yet.');
-          return textResult(`Your recent moments:\n${rows.map(summarizeMoment).join('\n\n')}`);
+          const { lines, omitted } = keepFirstWithinBudget(rows, summarizeMoment, 30_000);
+          const budgetNote = omitted > 0
+            ? ` Showing ${lines.length} of ${rows.length} fetched moments because the result was large.`
+            : '';
+          const lastShown = rows[lines.length - 1];
+          const hasMore = Array.isArray(data) ? rows.length >= limit : data?.hasMore === true;
+          const nextBefore = Array.isArray(data) ? lastShown.created_at : data?.nextBefore || lastShown.created_at;
+          const more = hasMore || omitted > 0
+            ? ` Older moments may be available. Use before=${nextBefore} to continue.`
+            : '';
+          return textResult(`Your recent moments:\n${lines.join('\n\n')}\n\nSource: imclaw moments mine.${budgetNote}${more}`);
         }
 
         if (params.action === 'publish') {

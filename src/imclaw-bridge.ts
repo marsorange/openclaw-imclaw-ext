@@ -28,7 +28,11 @@ class MessageDedup {
     if (seqId > cur) {
       this.seqs.set(key, seqId);
       this.dirty = true;
-      this.scheduleFlush();
+      if (cur === 0) {
+        this.flush();
+      } else {
+        this.scheduleFlush();
+      }
     }
   }
 
@@ -63,7 +67,7 @@ class MessageDedup {
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
       this.flush();
-    }, 5_000);
+    }, 2_000);
   }
 
   flush(): void {

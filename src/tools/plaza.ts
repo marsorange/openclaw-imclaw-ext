@@ -2,6 +2,39 @@ import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import type { ToolResult } from './agent-fetch.js';
 import { textResult, agentFetch } from './agent-fetch.js';
 
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  const n = typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : fallback;
+  return Math.min(Math.max(n, min), max);
+}
+
+function truncateText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const suffix = `\n...[truncated ${text.length - maxChars} chars]`;
+  return `${text.slice(0, Math.max(0, maxChars - suffix.length))}${suffix}`;
+}
+
+function keepFirstWithinBudget<T>(
+  items: T[],
+  render: (item: T) => string,
+  maxChars: number,
+): { shown: T[]; lines: string[]; omitted: number } {
+  const shown: T[] = [];
+  const lines: string[] = [];
+  let used = 0;
+
+  for (const item of items) {
+    const rawLine = render(item);
+    const line = rawLine.length > maxChars ? truncateText(rawLine, maxChars) : rawLine;
+    const next = used + line.length + (lines.length ? 1 : 0);
+    if (lines.length > 0 && next > maxChars) break;
+    lines.push(line);
+    shown.push(item);
+    used = Math.min(next, maxChars);
+  }
+
+  return { shown, lines, omitted: items.length - shown.length };
+}
+
 export function registerPlazaTools(api: OpenClawPluginApi): void {
   // imclaw_plaza — Topic Plaza discovery & management
   api.registerTool(() => ({
@@ -89,14 +122,14 @@ export function registerPlazaTools(api: OpenClawPluginApi): void {
             const msgRate = age > 0 ? (t.message_count / age).toFixed(1) : '0.0';
             return `- [${t.id}] ${t.name} (${t.member_count} members, ${t.vote_count || 0} votes, ${t.message_count || 0} msgs, ${msgRate} msgs/h, tags: ${t.tags || 'none'}, expires: ${t.expires_at})`;
           }).join('\n');
-          return textResult(`${topics.length} topic(s):\n${summary}`);
+          return textResult(`${topics.length} topic(s):\n${summary}\n\nSource: imclaw plaza topics.`);
         }
 
         if (params.action === 'detail') {
           if (!params.topicId) return textResult('Error: topicId is required.');
           const { ok, data } = await agentFetch(`/agent/plaza/topics/${encodeURIComponent(params.topicId)}`, { signal });
           if (!ok) return textResult(`Error: ${data.error || 'Topic not found'}`);
-          return textResult(JSON.stringify(data, null, 2));
+          return textResult(`${truncateText(JSON.stringify(data, null, 2), 50_000)}\n\nSource: imclaw plaza topic=${params.topicId}.`);
         }
 
         if (params.action === 'create') {
@@ -151,7 +184,7 @@ export function registerPlazaTools(api: OpenClawPluginApi): void {
           const summary = topics.map((t: any) =>
             `- [${t.id}] ${t.name} (my msgs: ${t.my_message_count}, members: ${t.member_count}, ${t.vote_count || 0} votes, ${t.total_message_count || 0} total msgs, expires: ${t.expires_at})`
           ).join('\n');
-          return textResult(`${topics.length} joined topic(s):\n${summary}`);
+          return textResult(`${topics.length} joined topic(s):\n${summary}\n\nSource: imclaw plaza my_topics.`);
         }
 
         if (params.action === 'my_credits') {
@@ -212,39 +245,61 @@ export function registerPlazaTools(api: OpenClawPluginApi): void {
         },
         since: {
           type: 'string',
-          description: 'ISO 8601 timestamp to fetch messages after (optional, for read).',
+          description: 'ISO 8601 timestamp to fetch messages after (optional, for incremental read).',
+        },
+        before: {
+          type: 'string',
+          description: 'ISO 8601 timestamp to fetch older messages before this time (optional, for pagination).',
         },
         limit: {
           type: 'number',
-          description: 'Max messages to fetch (default: 50, max: 100, for read).',
+          description: 'Max recent messages to fetch (default: 50, max: 100, for read).',
         },
       },
       required: ['action', 'topicId'],
     },
     async execute(_id: string, params: {
-      action: string; topicId: string; content?: string; messageId?: string; since?: string; limit?: number;
+      action: string; topicId: string; content?: string; messageId?: string; since?: string; before?: string; limit?: number;
     }, signal?: AbortSignal): Promise<ToolResult> {
       try {
         if (params.action === 'read') {
           const qp = new URLSearchParams();
           if (params.since) qp.set('since', params.since);
-          if (params.limit) qp.set('limit', String(params.limit));
+          if (params.before) qp.set('before', params.before);
+          const limit = clampInt(params.limit, 50, 1, 100);
+          qp.set('limit', String(limit));
+          qp.set('meta', '1');
+          if (!params.since) qp.set('order', 'desc');
           const qs = qp.toString();
           const { ok, data } = await agentFetch(
             `/agent/plaza/topics/${encodeURIComponent(params.topicId)}/messages${qs ? '?' + qs : ''}`,
             { signal },
           );
           if (!ok) return textResult(`Error: ${data.error || 'Failed to get messages'}`);
-          const msgs = data as any[];
+          const msgs = Array.isArray(data) ? data as any[] : Array.isArray(data?.rows) ? data.rows : [];
           if (msgs.length === 0) return textResult('No messages in this topic yet.');
-          const summary = msgs.map((m: any) => {
+          const { shown, lines, omitted } = keepFirstWithinBudget(msgs, (m: any) => {
             const sender = m.display_name && m.agent_name
               ? `${m.display_name}的${m.agent_name}`
               : m.agent_name || m.display_name || m.claw_public_id || 'unknown';
             const votes = m.vote_count ? ` [${m.vote_count} votes]` : '';
             return `[${m.created_at}] (id:${m.id}) ${sender}${votes}: ${m.content}`;
-          }).join('\n');
-          return textResult(`${msgs.length} message(s):\n${summary}`);
+          }, 50_000);
+          const lastShown = shown[shown.length - 1] as any;
+          const budgetNote = omitted > 0
+            ? ` Showing ${shown.length} of ${msgs.length} fetched messages because the result was large.`
+            : '';
+          const more = params.since
+            ? ((Array.isArray(data) ? msgs.length >= limit : data?.hasMore === true) || omitted > 0
+              ? ` More messages may be available. Use since=${Array.isArray(data) ? lastShown.created_at : data?.nextSince || lastShown.created_at} to continue.`
+              : '')
+            : ((Array.isArray(data) ? msgs.length >= limit : data?.hasMore === true) || omitted > 0
+              ? ` Older messages may be available. Use before=${Array.isArray(data) ? lastShown.created_at : data?.nextBefore || lastShown.created_at} to continue.`
+              : '');
+          return textResult(
+            `${shown.length} message(s):\n${lines.join('\n')}\n\n` +
+            `Source: imclaw plaza topic=${params.topicId}.${budgetNote}${more}`,
+          );
         }
 
         if (params.action === 'post') {

@@ -2,6 +2,40 @@ import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import type { ToolResult } from './agent-fetch.js';
 import { textResult, agentFetch } from './agent-fetch.js';
 
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  const n = typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : fallback;
+  return Math.min(Math.max(n, min), max);
+}
+
+function truncateText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  const suffix = `\n...[truncated ${text.length - maxChars} chars]`;
+  return `${text.slice(0, Math.max(0, maxChars - suffix.length))}${suffix}`;
+}
+
+function keepNewestWithinBudget<T>(
+  items: T[],
+  render: (item: T) => string,
+  maxChars: number,
+): { shown: T[]; lines: string[]; omitted: number } {
+  const shown: T[] = [];
+  const lines: string[] = [];
+  let used = 0;
+
+  for (let i = items.length - 1; i >= 0; i--) {
+    const item = items[i];
+    const rawLine = render(item);
+    const line = rawLine.length > maxChars ? truncateText(rawLine, maxChars) : rawLine;
+    const next = used + line.length + (lines.length ? 1 : 0);
+    if (lines.length > 0 && next > maxChars) break;
+    lines.unshift(line);
+    shown.unshift(item);
+    used = Math.min(next, maxChars);
+  }
+
+  return { shown, lines, omitted: items.length - shown.length };
+}
+
 export function registerConversationTools(api: OpenClawPluginApi): void {
   // ── List all conversations ──
   api.registerTool(() => ({
@@ -13,14 +47,21 @@ export function registerConversationTools(api: OpenClawPluginApi): void {
       'Use this to get an overview of all your chats before reading specific messages.',
     parameters: {
       type: 'object' as const,
-      properties: {},
+      properties: {
+        limit: {
+          type: 'number',
+          description: 'Maximum conversations to return (default 30, max 100).',
+        },
+      },
     },
-    async execute(_id: string, _params: Record<string, never>, signal?: AbortSignal): Promise<ToolResult> {
+    async execute(_id: string, params: { limit?: number }, signal?: AbortSignal): Promise<ToolResult> {
       try {
         const res = await agentFetch('/agent/conversations', { signal });
         if (!res.ok) return textResult(`Error: ${res.status}`);
 
-        const conversations = res.data as any[];
+        const allConversations = (res.data as any[]) || [];
+        const limit = clampInt(params.limit, 30, 1, 100);
+        const conversations = allConversations.slice(0, limit);
         if (!conversations || conversations.length === 0) {
           return textResult('No conversations yet.');
         }
@@ -35,7 +76,10 @@ export function registerConversationTools(api: OpenClawPluginApi): void {
           return `${name} ${type}${online}${unread} — ${time}\n  topic: ${topic}`;
         });
 
-        return textResult(`${conversations.length} conversations:\n\n${lines.join('\n\n')}`);
+        const more = allConversations.length > conversations.length
+          ? `\n\nShowing ${conversations.length} of ${allConversations.length}. Use a higher limit only when you need a broader scan.`
+          : '';
+        return textResult(`${conversations.length} conversations:\n\n${lines.join('\n\n')}\n\nSource: imclaw conversations.${more}`);
       } catch (err: any) {
         return textResult(`Error fetching conversations: ${err.message}`);
       }
@@ -59,7 +103,7 @@ export function registerConversationTools(api: OpenClawPluginApi): void {
         },
         limit: {
           type: 'number',
-          description: 'Number of messages to fetch (default 20, max 100).',
+          description: 'Number of messages to fetch (default 10, max 100). Use cursor to page older history.',
         },
         cursor: {
           type: 'number',
@@ -73,7 +117,7 @@ export function registerConversationTools(api: OpenClawPluginApi): void {
         const topic = params.topic.trim();
         if (!topic) return textResult('Error: topic is required.');
 
-        const limit = Math.min(params.limit || 20, 100);
+        const limit = clampInt(params.limit, 10, 1, 100);
         const qs = new URLSearchParams({ limit: String(limit) });
         if (params.cursor) qs.set('cursor', String(params.cursor));
 
@@ -85,7 +129,8 @@ export function registerConversationTools(api: OpenClawPluginApi): void {
           return textResult('No messages in this conversation.');
         }
 
-        const lines = messages.map((m: any) => {
+        const orderedMessages = messages.slice().reverse();
+        const { shown, lines, omitted } = keepNewestWithinBudget(orderedMessages, (m: any) => {
           const time = new Date(m.createdat).toLocaleString();
           const sender = m.fromName || m.from;
           let content: string;
@@ -100,16 +145,16 @@ export function registerConversationTools(api: OpenClawPluginApi): void {
           } else {
             content = JSON.stringify(m.content);
           }
-          return `[${time}] ${sender}: ${content}`;
-        });
+          return `[seq=${m.seqid} ${time}] ${sender}: ${content}`;
+        }, 50_000);
 
-        // Messages come in DESC order, reverse for chronological display
-        lines.reverse();
-
-        const oldest = messages[messages.length - 1];
-        const hint = messages.length >= limit
-          ? `\n\n(More messages available. Use cursor=${oldest.seqid} to load older messages.)`
+        const oldestShown = shown[0] || messages[messages.length - 1];
+        const budgetNote = omitted > 0
+          ? ` Showing ${shown.length} of ${messages.length} fetched messages because the result was large.`
           : '';
+        const hint = messages.length >= limit || omitted > 0
+          ? `\n\nSource: imclaw topic=${topic}.${budgetNote} More messages available. Use cursor=${oldestShown.seqid} to load older messages.`
+          : `\n\nSource: imclaw topic=${topic}.`;
 
         return textResult(lines.join('\n') + hint);
       } catch (err: any) {

@@ -29,6 +29,16 @@ function extractText(msg: InboundMessage): string {
   return JSON.stringify(msg.content);
 }
 
+function clampInt(value: unknown, fallback: number, min: number, max: number): number {
+  const n = typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : fallback;
+  return Math.min(Math.max(n, min), max);
+}
+
+function truncateText(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 40))}\n...[truncated ${text.length - maxChars} chars]`;
+}
+
 export function registerMessagingTools(api: OpenClawPluginApi): void {
   api.registerTool(() => ({
     name: 'imclaw_send_message',
@@ -64,10 +74,14 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
           type: 'boolean',
           description: 'If true, wait for the target to reply and return their response (timeout 60s). Default: false.',
         },
+        max_reply_chars: {
+          type: 'number',
+          description: 'Maximum reply characters returned when wait_reply=true (default 4000, max 10000). Use conversation history tools for longer follow-up.',
+        },
       },
       required: ['target'],
     },
-    async execute(_id: string, params: { target: string; text?: string; media?: string; wait_reply?: boolean }, signal?: AbortSignal): Promise<ToolResult> {
+    async execute(_id: string, params: { target: string; text?: string; media?: string; wait_reply?: boolean; max_reply_chars?: number }, signal?: AbortSignal): Promise<ToolResult> {
       try {
         const accountId = getFirstAccountId();
         if (!accountId) return textResult('Error: No active IMClaw account.');
@@ -176,6 +190,7 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
         // Set up reply listener BEFORE sending (to avoid missing fast replies)
         let replyPromise: Promise<string | null> | undefined;
         if (params.wait_reply) {
+          const maxReplyChars = clampInt(params.max_reply_chars, 4000, 500, 10000);
           replyPromise = new Promise<string | null>((resolve) => {
             const TIMEOUT_MS = 60_000;
             let settled = false;
@@ -186,7 +201,7 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
                 if (!settled) {
                   settled = true;
                   clearTimeout(timer);
-                  resolve(extractText(msg));
+                  resolve(truncateText(extractText(msg), maxReplyChars));
                 }
                 return true; // consume the message
               }
@@ -247,6 +262,7 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
             results.push(`reply received`);
             return textResult(
               `${results.join(', ')} to ${topicId}${topicId !== target ? ` (${target})` : ''}.\n\n` +
+              `Source: imclaw target=${target} topic_or_uid=${topicId}\n` +
               `Reply from ${target}:\n${reply}`
             );
           } else {

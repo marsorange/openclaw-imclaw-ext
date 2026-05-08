@@ -311,12 +311,14 @@ export class TinodeClient extends EventEmitter {
       console.log(`[tinode] {meta} sub count=${msg.meta.sub.length}`);
       for (const sub of msg.meta.sub) {
         console.log(`[tinode] {meta} topic=${sub.topic} with=${sub.with} user=${sub.user}`);
-        if (sub.topic && !this.subscribedTopics.has(sub.topic)) {
+        if (sub.topic && !this._reconnecting && !this.subscribedTopics.has(sub.topic)) {
           this.subscribeTopic(sub.topic).then(() => {
             console.log(`[tinode] subscribed to ${sub.topic} (resolved: ${this.resolvedTopics.get(sub.topic) || sub.topic})`);
           }).catch((err) => {
             console.error(`[tinode] subscribe FAILED for ${sub.topic}: ${err.message}`);
           });
+        } else if (sub.topic && this._reconnecting) {
+          console.log(`[tinode] {meta} skipped auto-subscribe during reconnect: ${sub.topic}`);
         }
         // Build user → p2p topic mapping from "me" subscriptions
         // Tinode uses "with" field for the other user in p2p topics
@@ -418,7 +420,9 @@ export class TinodeClient extends EventEmitter {
       try {
         this._reconnecting = true;
         // Snapshot before clearing
-        const topics = [...this.subscribedTopics];
+        const topics = [...new Set(
+          [...this.subscribedTopics].map((topic) => this.resolvedTopics.get(topic) || topic),
+        )];
         const resolvedSnapshot = new Map(this.resolvedTopics);
         const namesSnapshot = new Map(this.peerNames);
         // Clear sets so handlers and resubscribe loop work correctly on new connection

@@ -76,12 +76,109 @@ interface AccountContext {
   cleanup: () => Promise<void>;
 }
 
+type ImclawSenderKind = 'human' | 'agent' | 'unknown';
+type ImclawConversationKind = 'human_direct' | 'agent_direct' | 'unknown_direct' | 'group';
+type PeerIdentity = {
+  kind: ImclawSenderKind;
+  name: string;
+};
+
 const accounts = new Map<string, AccountContext>();
+const PEER_IDENTITY_TTL_MS = 5 * 60_000;
+const peerIdentityCache = new Map<string, { expiresAt: number; entries: Map<string, PeerIdentity> }>();
 
 /** Find account context by ID, or fall back to first connected account */
 function findAccountContext(accountId?: string | null): AccountContext | undefined {
   if (accountId) return accounts.get(accountId);
   return accounts.values().next().value as AccountContext | undefined;
+}
+
+function buildTypedDirectPeerId(senderKind: ImclawSenderKind, uid: string): string {
+  return `${senderKind}:${uid}`;
+}
+
+function buildImclawDirectSessionKey(params: {
+  agentId: string;
+  accountId: string;
+  typedPeerId: string;
+}): string {
+  return `agent:${params.agentId}:imclaw:${params.accountId}:dm:${params.typedPeerId}`;
+}
+
+function classifySenderKindFromName(name: string | null | undefined): ImclawSenderKind {
+  const normalized = (name || '').trim().toLowerCase();
+  if (normalized.startsWith('human_')) return 'human';
+  if (normalized.startsWith('claw_')) return 'agent';
+  return 'unknown';
+}
+
+async function resolvePeerIdentity(params: {
+  accountCtx: AccountContext | undefined;
+  uid: string;
+  fallbackName: string;
+  ownerUid?: string | null;
+}): Promise<PeerIdentity> {
+  if (params.ownerUid && params.uid === params.ownerUid) {
+    return { kind: 'human', name: params.fallbackName };
+  }
+
+  const nameKind = classifySenderKindFromName(params.fallbackName);
+  if (nameKind !== 'unknown') return { kind: nameKind, name: params.fallbackName };
+
+  const accountCtx = params.accountCtx;
+  if (!accountCtx) return { kind: 'unknown', name: params.fallbackName };
+
+  const now = Date.now();
+  const cached = peerIdentityCache.get(accountCtx.accountId);
+  if (cached && cached.expiresAt > now) {
+    return cached.entries.get(params.uid) || { kind: 'unknown', name: params.fallbackName };
+  }
+
+  const entries = new Map<string, PeerIdentity>();
+  try {
+    const [ownerRes, contactsRes] = await Promise.allSettled([
+      fetch(`${accountCtx.humanApiUrl}/agent/owner`, {
+        headers: { 'Authorization': `Basic ${accountCtx.heartbeatAuth}` },
+        signal: AbortSignal.timeout(5_000),
+      }),
+      fetch(`${accountCtx.humanApiUrl}/agent/contacts`, {
+        headers: { 'Authorization': `Basic ${accountCtx.heartbeatAuth}` },
+        signal: AbortSignal.timeout(10_000),
+      }),
+    ]);
+
+    if (ownerRes.status === 'fulfilled' && ownerRes.value.ok) {
+      const owner = await ownerRes.value.json() as any;
+      if (owner?.tinode_uid) {
+        entries.set(owner.tinode_uid, {
+          kind: 'human',
+          name: owner.display_name || owner.tinode_uid,
+        });
+      }
+    }
+
+    if (contactsRes.status === 'fulfilled' && contactsRes.value.ok) {
+      const contacts = await contactsRes.value.json() as any[];
+      for (const contact of contacts) {
+        if (!contact?.contact_tinode_uid) continue;
+        entries.set(contact.contact_tinode_uid, {
+          kind: 'agent',
+          name: contact.contact_agent_name
+            || contact.alias
+            || contact.contact_claw_name
+            || contact.contact_tinode_uid,
+        });
+      }
+    }
+  } catch {
+    // Best effort only; fall back to Tinode metadata.
+  }
+
+  peerIdentityCache.set(accountCtx.accountId, {
+    expiresAt: now + PEER_IDENTITY_TTL_MS,
+    entries,
+  });
+  return entries.get(params.uid) || { kind: 'unknown', name: params.fallbackName };
 }
 
 async function assertGroupFeatureEnabledForTarget(actx: AccountContext, target: string): Promise<void> {
@@ -262,10 +359,31 @@ function isThinkingBlockError(text: string): boolean {
     && text.includes('block');
 }
 
+function isRecoverableSessionContextError(text: string): boolean {
+  return isThinkingBlockError(text) ||
+    /Agent couldn't generate a response/i.test(text) ||
+    /context[_\s-]?(?:limit|overflow|length)/i.test(text) ||
+    /prompt too (?:large|long)/i.test(text) ||
+    /maximum context length/i.test(text) ||
+    /token[_\s-]?limit[_\s-]?(?:exceeded|reached)/i.test(text) ||
+    /compaction[_\s-]?(?:buffer|reserve)/i.test(text);
+}
+
 // Track corrupted session keys → rotated suffix with TTL, so future messages skip the broken session
 // TTL prevents permanent conversation fragmentation from transient errors
 const SESSION_KEY_TTL = 30 * 60 * 1000; // 30 minutes
 const corruptedSessionKeys = new Map<string, { suffix: string; expiry: number }>();
+
+const SESSION_BOUNDARY_STATE_DIR = path.join(os.homedir(), '.openclaw', 'imclaw');
+const SESSION_BOUNDARY_STATE_PATH = path.join(SESSION_BOUNDARY_STATE_DIR, 'session-boundaries.json');
+const DEFAULT_SESSION_ROTATE_TOPIC_MESSAGES = 80;
+const MAX_SESSION_BOUNDARIES = 1000;
+
+type SessionBoundaryState = Record<string, { seqId: number; updatedAt: number }>;
+let sessionBoundariesLoaded = false;
+let sessionBoundariesDirty = false;
+let sessionBoundariesFlushTimer: NodeJS.Timeout | null = null;
+const manualSessionBoundaries = new Map<string, { seqId: number; updatedAt: number }>();
 
 function getCorruptedSuffix(baseKey: string): string | undefined {
   const entry = corruptedSessionKeys.get(baseKey);
@@ -279,6 +397,117 @@ function getCorruptedSuffix(baseKey: string): string | undefined {
 
 function setCorruptedSuffix(baseKey: string, suffix: string): void {
   corruptedSessionKeys.set(baseKey, { suffix, expiry: Date.now() + SESSION_KEY_TTL });
+}
+
+function loadSessionBoundaries(): void {
+  if (sessionBoundariesLoaded) return;
+  sessionBoundariesLoaded = true;
+  try {
+    if (!fs.existsSync(SESSION_BOUNDARY_STATE_PATH)) return;
+    const parsed = JSON.parse(fs.readFileSync(SESSION_BOUNDARY_STATE_PATH, 'utf-8')) as SessionBoundaryState;
+    if (!parsed || typeof parsed !== 'object') return;
+    for (const [key, value] of Object.entries(parsed)) {
+      if (
+        value &&
+        Number.isFinite(value.seqId) &&
+        value.seqId > 0 &&
+        Number.isFinite(value.updatedAt)
+      ) {
+        manualSessionBoundaries.set(key, { seqId: value.seqId, updatedAt: value.updatedAt });
+      }
+    }
+  } catch { /* best-effort local state */ }
+}
+
+function scheduleSessionBoundariesFlush(): void {
+  if (sessionBoundariesFlushTimer) return;
+  sessionBoundariesFlushTimer = setTimeout(() => {
+    sessionBoundariesFlushTimer = null;
+    flushSessionBoundaries();
+  }, 5_000);
+}
+
+function flushSessionBoundaries(): void {
+  if (!sessionBoundariesDirty) return;
+  try {
+    fs.mkdirSync(SESSION_BOUNDARY_STATE_DIR, { recursive: true });
+    const entries = [...manualSessionBoundaries.entries()]
+      .sort((a, b) => b[1].updatedAt - a[1].updatedAt)
+      .slice(0, MAX_SESSION_BOUNDARIES);
+    manualSessionBoundaries.clear();
+    const state: SessionBoundaryState = {};
+    for (const [key, value] of entries) {
+      manualSessionBoundaries.set(key, value);
+      state[key] = value;
+    }
+    fs.writeFileSync(SESSION_BOUNDARY_STATE_PATH, JSON.stringify(state), { mode: 0o600 });
+    sessionBoundariesDirty = false;
+  } catch { /* best-effort local state */ }
+}
+
+function makeSessionBoundaryKey(accountId: string, topic: string): string {
+  return `${accountId}:${topic}`;
+}
+
+function rememberManualSessionBoundary(accountId: string, topic: string, seqId: number): void {
+  loadSessionBoundaries();
+  const key = makeSessionBoundaryKey(accountId, topic);
+  const current = manualSessionBoundaries.get(key);
+  if (current && current.seqId >= seqId) return;
+  manualSessionBoundaries.set(key, { seqId, updatedAt: Date.now() });
+  sessionBoundariesDirty = true;
+  scheduleSessionBoundariesFlush();
+}
+
+function getManualSessionBoundary(accountId: string, topic: string): { seqId: number; updatedAt: number } | undefined {
+  loadSessionBoundaries();
+  return manualSessionBoundaries.get(makeSessionBoundaryKey(accountId, topic));
+}
+
+function resolveSessionRotateTopicMessages(): number {
+  const raw = Number(pluginLevelConfig.sessionRotateTopicMessages ?? pluginLevelConfig.sessionRotateMessages);
+  if (raw === 0) return 0;
+  if (!Number.isFinite(raw) || raw < 0) return DEFAULT_SESSION_ROTATE_TOPIC_MESSAGES;
+  return Math.max(20, Math.min(1000, Math.floor(raw)));
+}
+
+function isManualSessionBoundaryControl(content: any): boolean {
+  return !!content &&
+    typeof content === 'object' &&
+    content.tp === 'control' &&
+    content.scope === 'imclaw' &&
+    content.event === 'agent_chat_new_session';
+}
+
+function resolveBoundedSessionKey(params: {
+  baseSessionKey: string;
+  accountId: string;
+  topic: string;
+  seqId: number;
+}): { sessionKeyBase: string; rolloverNotice?: string } {
+  const limit = resolveSessionRotateTopicMessages();
+  const boundary = getManualSessionBoundary(params.accountId, params.topic);
+  const parts: string[] = [];
+  let baseSeq = 0;
+
+  if (boundary && params.seqId > boundary.seqId) {
+    parts.push(`manual-${boundary.seqId}`);
+    baseSeq = boundary.seqId;
+  }
+
+  if (limit > 0) {
+    const relativeSeq = Math.max(0, params.seqId - baseSeq - 1);
+    const segment = Math.floor(relativeSeq / limit);
+    if (segment > 0 || parts.length > 0) parts.push(`seg-${segment}`);
+  }
+
+  if (parts.length === 0) return { sessionKeyBase: params.baseSessionKey };
+
+  const sessionKeyBase = `${params.baseSessionKey}:${parts.join('-')}`;
+  const rolloverNotice = boundary && params.seqId > boundary.seqId
+    ? `IMClaw runtime note: the human started a new IMClaw chat session at topic seq ${boundary.seqId}; earlier messages remain in IMClaw history but are not loaded in this runtime context.`
+    : `IMClaw runtime note: this long IMClaw conversation was automatically continued in a fresh runtime context segment. Earlier messages remain in IMClaw history but are not loaded in this runtime context.`;
+  return { sessionKeyBase, rolloverNotice };
 }
 
 // ─── Spam repetition detection ───
@@ -370,16 +599,34 @@ function notifyReplyDelivered(
   fromUid: string | null | undefined,
   content: string,
 ): void {
+  notifyReplyDeliveredBatch(accountCtx, [{
+    topic,
+    seqId,
+    fromUid,
+    content,
+  }]);
+}
+
+function notifyReplyDeliveredBatch(
+  accountCtx: AccountContext | undefined,
+  messages: Array<{
+    topic: string;
+    seqId: number;
+    fromUid: string | null | undefined;
+    content: string;
+  }>,
+): void {
   if (!accountCtx || accountCtx.stopped) return;
+  if (messages.length === 0) return;
   const body = JSON.stringify({
-    messages: [{
-      topic,
-      seqId,
-      fromUid: fromUid || '',
-      content,
+    messages: messages.map((message) => ({
+      topic: message.topic,
+      seqId: message.seqId,
+      fromUid: message.fromUid || '',
+      content: message.content,
       timestamp: new Date().toISOString(),
       direction: 'outbound' as const,
-    }],
+    })),
   });
   fetch(`${accountCtx.humanApiUrl}/agent/messages/sync`, {
     method: 'POST',
@@ -391,7 +638,9 @@ function notifyReplyDelivered(
     signal: AbortSignal.timeout(5_000),
   }).then(res => {
     if (res.ok) {
-      accountCtx.log?.debug?.(`[imclaw] reply notification sent: topic=${topic} seq=${seqId}`);
+      accountCtx.log?.debug?.(
+        `[imclaw] reply notification sent: count=${messages.length} seqs=${messages.map(m => m.seqId).join(',')}`,
+      );
     } else {
       accountCtx.log?.warn?.(`[imclaw] reply notification failed: ${res.status}`);
     }
@@ -448,6 +697,17 @@ function registerMessageHandler(
       ? msg.content.substring(0, 100)
       : JSON.stringify(msg.content).substring(0, 100);
     log?.info?.(`[imclaw-channel] onMessage: topic=${msg.topic} from=${msg.from} seq=${msg.seqId} isGroup=${msg.isGroup} content=${contentPreview}`);
+
+    if (isManualSessionBoundaryControl(msg.content)) {
+      const ownerUidForControl = accounts.get(accountId)?.ownerTinodeUid;
+      if (!msg.isGroup && (!ownerUidForControl || ownerUidForControl === msg.from)) {
+        rememberManualSessionBoundary(accountId, msg.topic, msg.seqId);
+        log?.info?.(`[imclaw-channel] recorded manual session boundary: topic=${msg.topic} seq=${msg.seqId}`);
+      } else {
+        log?.warn?.(`[imclaw-channel] ignored unauthorized session boundary control: topic=${msg.topic} from=${msg.from}`);
+      }
+      return;
+    }
 
     let text: string | undefined;
     let mediaUrl: string | undefined;
@@ -513,13 +773,32 @@ function registerMessageHandler(
       log?.info?.(`[imclaw-channel] ignored group message because groups are disabled: topic=${msg.topic}`);
       return;
     }
-    const peerId = isGroup ? msg.topic : msg.from;
+    const currentAccountCtx = accounts.get(accountId);
+    const ownerUid = currentAccountCtx?.ownerTinodeUid;
+    const tinodePeerName = bridge.getPeerName(msg.from) || msg.from;
+    const peerIdentity = await resolvePeerIdentity({
+      accountCtx: currentAccountCtx,
+      uid: msg.from,
+      fallbackName: tinodePeerName,
+      ownerUid,
+    });
+    const senderName = peerIdentity.name;
+    const senderKind = peerIdentity.kind;
+    const conversationKind: ImclawConversationKind = isGroup
+      ? 'group'
+      : senderKind === 'agent'
+        ? 'agent_direct'
+        : senderKind === 'human'
+          ? 'human_direct'
+          : 'unknown_direct';
+    const typedPeerId = isGroup ? msg.topic : buildTypedDirectPeerId(senderKind, msg.from);
+    const peerId = typedPeerId;
 
     // Resolve agent route via OpenClaw's standard routing system.
     // This allows users to bind specific agents (including sub-agents) to
     // IMClaw via the `bindings` config in openclaw.yaml.
     const currentCfg = (rt.config as any).current?.() ?? rt.config.loadConfig();
-    const route = rt.channel.routing?.resolveAgentRoute?.({
+    let route = rt.channel.routing?.resolveAgentRoute?.({
       cfg: currentCfg,
       channel: 'imclaw',
       accountId,
@@ -528,28 +807,64 @@ function registerMessageHandler(
         id: peerId,
       },
     });
+    if (!isGroup && route?.matchedBy === 'default') {
+      const legacyRoute = rt.channel.routing?.resolveAgentRoute?.({
+        cfg: currentCfg,
+        channel: 'imclaw',
+        accountId,
+        peer: {
+          kind: 'direct',
+          id: msg.from,
+        },
+      });
+      if (legacyRoute && legacyRoute.matchedBy !== 'default') {
+        route = legacyRoute;
+        log?.info?.(`[imclaw-channel] using legacy raw-uid binding for ${msg.from}; prefer peer.id="${peerId}"`);
+      }
+    }
 
-    const routeSessionKey = route?.sessionKey;
     const routeAccountId = route?.accountId ?? accountId;
+    const routeOwnerUid = accounts.get(routeAccountId)?.ownerTinodeUid ?? ownerUid;
     const approvalStateKey = makeApprovalStateKey(routeAccountId, msg.topic);
 
-    // Fallback session key when routing API is unavailable (older OpenClaw versions)
-    const baseSessionKey = routeSessionKey
-      || (isGroup ? `imclaw:${accountId}:${msg.topic}` : `imclaw:${accountId}:${msg.from}`);
+    const routeAgentId = route?.agentId || 'main';
+    const routeSessionKey = route?.sessionKey;
+    // IMClaw has two direct-message classes: human<->agent and agent<->agent.
+    // OpenClaw's default dmScope may collapse all direct messages to main, so
+    // force direct IMClaw traffic into a typed peer namespace while still using
+    // resolveAgentRoute for agent/account selection and explicit bindings.
+    const baseSessionKey = isGroup
+      ? (routeSessionKey || `agent:${routeAgentId}:imclaw:group:${msg.topic}`)
+      : buildImclawDirectSessionKey({
+        agentId: routeAgentId,
+        accountId: routeAccountId,
+        typedPeerId,
+      });
 
     if (route?.agentId) {
       log?.info?.(`[imclaw-channel] routed to agent "${route.agentId}" (matched by: ${route.matchedBy || 'default'})`);
     }
+    log?.info?.(
+      `[imclaw-channel] classified sender=${senderKind} conversation=${conversationKind} peer=${peerId} name=${senderName}`,
+    );
+
+    const boundedSession = resolveBoundedSessionKey({
+      baseSessionKey,
+      accountId: routeAccountId,
+      topic: msg.topic,
+      seqId: msg.seqId,
+    });
+    const activeBaseSessionKey = boundedSession.sessionKeyBase;
+    if (activeBaseSessionKey !== baseSessionKey) {
+      log?.info?.(`[imclaw-channel] using bounded session key: ${activeBaseSessionKey}`);
+    }
 
     // If this session was previously corrupted (within TTL), use the rotated suffix
-    const existingSuffix = getCorruptedSuffix(baseSessionKey);
-
-    // Resolve owner UID once — used for approval shortcuts and sender role
-    const ownerUid = accounts.get(routeAccountId)?.ownerTinodeUid;
+    const existingSuffix = getCorruptedSuffix(activeBaseSessionKey);
 
     // Natural-language approval shortcuts:
     // "确认/同意/拒绝" → "/approve <id> <decision>" when a pending approval exists.
-    const isOwnerDirectMessage = !isGroup && (!ownerUid || ownerUid === msg.from);
+    const isOwnerDirectMessage = !isGroup && !!routeOwnerUid && routeOwnerUid === msg.from;
     if (text && isOwnerDirectMessage) {
       const pending = getPendingApproval(approvalStateKey);
       if (pending) {
@@ -569,10 +884,12 @@ function registerMessageHandler(
     // Resolve sender role so the agent knows who it's talking to
     const resolveSenderRole = (): string => {
       if (!isGroup) {
-        return (!ownerUid || ownerUid === msg.from) ? 'owner' : 'peer';
+        if (routeOwnerUid && routeOwnerUid === msg.from) return 'owner';
+        return senderKind === 'agent' ? 'agent_peer' : 'peer';
       }
       // Group: owner is still owner; everyone else is a group member
-      return (ownerUid && ownerUid === msg.from) ? 'owner' : 'group_member';
+      if (routeOwnerUid && routeOwnerUid === msg.from) return 'owner';
+      return senderKind === 'agent' ? 'agent_group_member' : 'group_member';
     };
     const senderRole = resolveSenderRole();
 
@@ -590,14 +907,22 @@ function registerMessageHandler(
         OriginatingChannel: 'imclaw' as any,
         OriginatingTo: msg.from,
         ChatType: isGroup ? 'group' : 'direct',
-        SenderName: bridge.getPeerName(msg.from) || msg.from,
+        SenderName: senderName,
         SenderId: msg.from,
+        SenderKind: senderKind,
         SenderRole: senderRole,
+        ConversationKind: conversationKind,
         Provider: 'imclaw',
         Surface: 'imclaw',
-        ConversationLabel: isGroup ? msg.topic : msg.from,
+        ConversationLabel: isGroup ? msg.topic : typedPeerId,
+        ReplyingToTopic: msg.topic,
+        ReplyingToSeqId: msg.seqId,
+        ReplyingToSenderId: msg.from,
         Timestamp: Date.now(),
         CommandAuthorized: true,
+        ...(boundedSession.rolloverNotice ? {
+          UntrustedContext: [boundedSession.rolloverNotice],
+        } : {}),
         ...(mediaUrl ? {
           MediaUrl: mediaUrl,
           MediaPath: localMediaPath || mediaUrl,
@@ -616,7 +941,7 @@ function registerMessageHandler(
       await runWithToolAccount({
         accountId: routeAccountId ?? null,
         chatType: isGroup ? 'group' : 'direct',
-        conversationLabel: isGroup ? msg.topic : msg.from,
+        conversationLabel: isGroup ? msg.topic : typedPeerId,
         sessionKey,
         senderId: msg.from,
         originatingTo: msg.topic,
@@ -629,6 +954,10 @@ function registerMessageHandler(
               log?.info?.(`[imclaw-channel] deliver callback: text=${(payload?.text || payload?.body || '').substring(0, 80)} mediaUrl=${payload?.mediaUrl || 'none'}`);
               try {
                 const replyText = (payload?.text ?? payload?.body)?.trim();
+                if (replyText && isRecoverableSessionContextError(replyText)) {
+                  thinkingErrorDetected = true;
+                  log?.warn?.(`[imclaw-channel] recoverable session context error detected in reply, will retry with new session`);
+                }
                 const suppressReply = !!replyText && shouldSuppressAgentBugText(replyText);
                 if (suppressReply) {
                   log?.warn?.(`[imclaw-channel] suppressed suspected upstream bug message: ${(replyText || '').slice(0, 120)}`);
@@ -643,17 +972,26 @@ function registerMessageHandler(
                   }
 
                   // Detect thinking block error before sending
-                  if (isThinkingBlockError(replyText)) {
+                  if (isRecoverableSessionContextError(replyText)) {
                     thinkingErrorDetected = true;
-                    log?.warn?.(`[imclaw-channel] thinking block error detected in reply, will retry with new session`);
+                    log?.warn?.(`[imclaw-channel] recoverable session context error detected in reply, will retry with new session`);
                   }
 
                   const MAX_CHUNK = 4000;
                   const actx = findAccountContext(routeAccountId);
                   const selfUid = bridge.getSelfUid?.();
+                  const deliveredMessages: Array<{
+                    topic: string;
+                    seqId: number;
+                    fromUid: string | null | undefined;
+                    content: string;
+                  }> = [];
                   if (replyText.length <= MAX_CHUNK) {
                     const seqId = await bridge.sendMessage(msg.topic, replyText);
-                    notifyReplyDelivered(actx, msg.topic, seqId, selfUid, replyText);
+                    deliveredMessages.push({ topic: msg.topic, seqId, fromUid: selfUid, content: replyText });
+                    log?.info?.(
+                      `[imclaw] → ${msg.topic} seq=${seqId} replying_to=${msg.topic}/${msg.from}/${msg.seqId} kind=${conversationKind}`,
+                    );
                   } else {
                     const chunks: string[] = [];
                     let remaining = replyText;
@@ -670,9 +1008,13 @@ function registerMessageHandler(
                     }
                     for (const chunk of chunks) {
                       const seqId = await bridge.sendMessage(msg.topic, chunk);
-                      notifyReplyDelivered(actx, msg.topic, seqId, selfUid, chunk);
+                      deliveredMessages.push({ topic: msg.topic, seqId, fromUid: selfUid, content: chunk });
+                      log?.info?.(
+                        `[imclaw] → ${msg.topic} seq=${seqId} replying_to=${msg.topic}/${msg.from}/${msg.seqId} kind=${conversationKind}`,
+                      );
                     }
                   }
+                  notifyReplyDeliveredBatch(actx, deliveredMessages);
                   log?.info?.(`[imclaw] → ${msg.topic} reply ${replyText.length} chars`);
                 }
 
@@ -704,8 +1046,8 @@ function registerMessageHandler(
 
     // Determine initial session key (use rotated key if previously corrupted)
     const initialSessionKey = existingSuffix
-      ? `${baseSessionKey}:${existingSuffix}`
-      : baseSessionKey;
+      ? `${activeBaseSessionKey}:${existingSuffix}`
+      : activeBaseSessionKey;
 
     const DISPATCH_TIMEOUT_MS = 120_000; // 2 minutes
     try {
@@ -718,9 +1060,9 @@ function registerMessageHandler(
       ]);
     } catch (err: any) {
       // Detect thinking block error from thrown exception
-      if (isThinkingBlockError(err.message || '')) {
+      if (isRecoverableSessionContextError(err.message || '')) {
         thinkingErrorDetected = true;
-        log?.warn?.(`[imclaw-channel] thinking block error detected in exception: ${err.message}`);
+        log?.warn?.(`[imclaw-channel] recoverable session context error detected in exception: ${err.message}`);
       } else {
         log?.error?.(`[imclaw-channel] dispatch error: ${err.message}\n${err.stack}`);
       }
@@ -729,8 +1071,8 @@ function registerMessageHandler(
     if (thinkingErrorDetected) {
       // Rotate session key with TTL so future messages skip the broken session temporarily
       const newSuffix = `rs-${Date.now()}`;
-      setCorruptedSuffix(baseSessionKey, newSuffix);
-      const newSessionKey = `${baseSessionKey}:${newSuffix}`;
+      setCorruptedSuffix(activeBaseSessionKey, newSuffix);
+      const newSessionKey = `${activeBaseSessionKey}:${newSuffix}`;
       log?.info?.(`[imclaw-channel] session corrupted, rotating key: ${initialSessionKey} → ${newSessionKey}`);
 
       try {
