@@ -285,6 +285,7 @@ export class ImclawBridge {
         'Content-Type': `multipart/form-data; boundary=${boundary}`,
       },
       body,
+      signal: AbortSignal.timeout(30_000),
     });
 
     if (!resp.ok) {

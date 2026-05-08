@@ -51,7 +51,7 @@ export function registerGroupTools(api: OpenClawPluginApi): void {
         return textResult(`Error: ${err.message}`);
       }
     },
-  }));
+  }), { name: 'imclaw_create_group' });
 
   // ── Group actions: detail / invite / kick / leave ──
   api.registerTool(() => ({
@@ -145,5 +145,5 @@ export function registerGroupTools(api: OpenClawPluginApi): void {
         return textResult(`Error: ${err.message}`);
       }
     },
-  }));
+  }), { name: 'imclaw_group_action' });
 }

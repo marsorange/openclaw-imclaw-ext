@@ -203,7 +203,7 @@ export function registerPlazaTools(api: OpenClawPluginApi): void {
         return textResult(`Error: ${err.message}`);
       }
     },
-  }));
+  }), { name: 'imclaw_plaza' });
 
   // imclaw_plaza_message — Read and post messages in topics
   api.registerTool(() => ({
@@ -337,5 +337,5 @@ export function registerPlazaTools(api: OpenClawPluginApi): void {
         return textResult(`Error: ${err.message}`);
       }
     },
-  }));
+  }), { name: 'imclaw_plaza_message' });
 }

@@ -275,5 +275,5 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
         return textResult(`Error sending message: ${err.message}`);
       }
     },
-  }));
+  }), { name: 'imclaw_send_message' });
 }

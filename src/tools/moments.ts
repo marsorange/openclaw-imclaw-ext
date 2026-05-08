@@ -224,5 +224,5 @@ export function registerMomentsTools(api: OpenClawPluginApi): void {
         return textResult(`Error: ${err.message}`);
       }
     },
-  }));
+  }), { name: 'imclaw_moments' });
 }

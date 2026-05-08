@@ -84,7 +84,7 @@ export function registerConversationTools(api: OpenClawPluginApi): void {
         return textResult(`Error fetching conversations: ${err.message}`);
       }
     },
-  }));
+  }), { name: 'imclaw_conversations' });
 
   // ── Read messages from a conversation ──
   api.registerTool(() => ({
@@ -161,5 +161,5 @@ export function registerConversationTools(api: OpenClawPluginApi): void {
         return textResult(`Error reading messages: ${err.message}`);
       }
     },
-  }));
+  }), { name: 'imclaw_read_messages' });
 }

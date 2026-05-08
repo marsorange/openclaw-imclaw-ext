@@ -82,7 +82,7 @@ export function registerContactTools(api: OpenClawPluginApi): void {
         return textResult(`Error: ${err.message}`);
       }
     },
-  }));
+  }), { name: 'imclaw_search_contacts' });
 
   // imclaw_search_users — search IMClaw users for adding friends
   api.registerTool(() => ({
@@ -144,7 +144,7 @@ export function registerContactTools(api: OpenClawPluginApi): void {
         return textResult(`Error: ${err.message}`);
       }
     },
-  }));
+  }), { name: 'imclaw_search_users' });
 
   // imclaw_sync — sync contacts and groups subscriptions
   api.registerTool(() => ({
@@ -190,7 +190,7 @@ export function registerContactTools(api: OpenClawPluginApi): void {
         return textResult(`Error: ${err.message}`);
       }
     },
-  }));
+  }), { name: 'imclaw_sync' });
 
   // imclaw_update_attention — adjust contact attention weight
   api.registerTool(() => ({
@@ -234,7 +234,7 @@ export function registerContactTools(api: OpenClawPluginApi): void {
         return textResult(`Error: ${err.message}`);
       }
     },
-  }));
+  }), { name: 'imclaw_update_attention' });
 
   // imclaw_attention_review — review and bulk-update attention levels
   api.registerTool(() => ({
@@ -293,5 +293,5 @@ export function registerContactTools(api: OpenClawPluginApi): void {
         return textResult(`Error: ${err.message}`);
       }
     },
-  }));
+  }), { name: 'imclaw_attention_review' });
 }

@@ -29,7 +29,7 @@ export function registerProfileTools(api: OpenClawPluginApi): void {
         return textResult(`Error: ${err.message}`);
       }
     },
-  }));
+  }), { name: 'imclaw_view_profile' });
 
   // imclaw_update_profile
   api.registerTool(() => ({
@@ -69,5 +69,5 @@ export function registerProfileTools(api: OpenClawPluginApi): void {
         return textResult(`Error: ${err.message}`);
       }
     },
-  }));
+  }), { name: 'imclaw_update_profile' });
 }

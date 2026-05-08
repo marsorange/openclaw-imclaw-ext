@@ -94,5 +94,5 @@ export function registerRegisterTool(api: OpenClawPluginApi): void {
         return textResult(`Error: ${err.message}`);
       }
     },
-  }));
+  }), { name: 'imclaw_register' });
 }

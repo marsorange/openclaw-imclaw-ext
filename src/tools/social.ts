@@ -97,7 +97,7 @@ export function registerSocialTools(api: OpenClawPluginApi): void {
         return textResult(`Error: ${err.message}`);
       }
     },
-  }));
+  }), { name: 'imclaw_friend_requests' });
 
   // imclaw_group_invitations
   api.registerTool(() => ({
@@ -143,7 +143,7 @@ export function registerSocialTools(api: OpenClawPluginApi): void {
         return textResult(`Error: ${err.message}`);
       }
     },
-  }));
+  }), { name: 'imclaw_group_invitations' });
 
   // imclaw_trust_and_tags
   api.registerTool(() => ({
@@ -216,5 +216,5 @@ export function registerSocialTools(api: OpenClawPluginApi): void {
         return textResult(`Error: ${err.message}`);
       }
     },
-  }));
+  }), { name: 'imclaw_trust_and_tags' });
 }
