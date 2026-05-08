@@ -70,10 +70,10 @@ const plugin = {
  * broke every tool call.
  *
  * Strategy:
- *  1. If tools.allow is absent or tools.profile is "full" — nothing to do.
- *  2. If tools.allow contains the bare "imclaw" entry — replace it with
+ *  1. If tools.allow contains the bare "imclaw" entry — replace it with
  *     the actual tool names declared in contracts.tools.
- *  3. Otherwise — just warn.
+ *  2. If tools.allow is absent — nothing to do.
+ *  3. Otherwise — warn when no IMClaw tool names are allowed.
  */
 function ensureToolsProfile(api: OpenClawPluginApi) {
   if (!api.runtime) return;
@@ -81,33 +81,25 @@ function ensureToolsProfile(api: OpenClawPluginApi) {
     const cfg = ((api.runtime.config as any).current?.() ?? api.config) as Record<string, any>;
     const tools = cfg?.tools;
 
-    // Case 1: no restrictions — tools are available by default
+    // Case 1: no tools config — tools are available by default
     if (!tools) return;
     const profile = tools.profile;
-    if (!profile || profile === 'full') return;
-    if (!Array.isArray(tools.allow) || tools.allow.length === 0) {
-      // tools.profile is restrictive but no allowlist — just warn
-      api.logger.warn(
-        `[imclaw] tools.profile is "${profile}" — imclaw tools may not be available. Set tools.profile to "full" for full access.`,
-      );
-      return;
-    }
+    const allow: string[] | null = Array.isArray(tools.allow) ? tools.allow : null;
 
-    const allow: string[] = tools.allow;
-
-    // Case 2: allowlist exists but contains bare "imclaw" — fix it
-    const imclawIdx = allow.indexOf('imclaw');
+    // Case 2: allowlist exists but contains bare "imclaw" — fix it even
+    // when profile is "full"; OpenClaw still treats tools.allow literally.
+    const imclawIdx = allow?.indexOf('imclaw') ?? -1;
     if (imclawIdx !== -1) {
       const declaredTools: string[] = manifest?.contracts?.tools;
       if (Array.isArray(declaredTools) && declaredTools.length > 0) {
         // Remove bare "imclaw" and splice in actual tool names
-        allow.splice(imclawIdx, 1, ...declaredTools);
+        allow!.splice(imclawIdx, 1, ...declaredTools);
         api.logger.info(
           `[imclaw] replaced bare "imclaw" in tools.allow with ${declaredTools.length} declared tool names`,
         );
       } else {
         // No manifest data — just remove the bad entry
-        allow.splice(imclawIdx, 1);
+        allow!.splice(imclawIdx, 1);
         api.logger.warn(
           `[imclaw] removed non-matching "imclaw" from tools.allow — declare contracts.tools in manifest for auto-fix`,
         );
@@ -123,7 +115,17 @@ function ensureToolsProfile(api: OpenClawPluginApi) {
       return;
     }
 
-    // Case 3: allowlist exists without "imclaw" — check if any imclaw tool is listed
+    // Case 3: no allowlist.
+    if (!allow || allow.length === 0) {
+      if (profile && profile !== 'full') {
+        api.logger.warn(
+          `[imclaw] tools.profile is "${profile}" — imclaw tools may not be available. Set tools.profile to "full" for full access.`,
+        );
+      }
+      return;
+    }
+
+    // Case 4: allowlist exists without "imclaw" — check if any imclaw tool is listed
     const hasImclawTool = allow.some((e: string) => e.startsWith('imclaw_'));
     if (!hasImclawTool) {
       api.logger.warn(
