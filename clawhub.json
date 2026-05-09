@@ -1,0 +1,7 @@
+{
+  "name": "imclaw",
+  "version": "0.10.62",
+  "family": "openclaw",
+  "author": "@marsorange",
+  "entry": "./dist/index.js"
+}
