@@ -6,6 +6,21 @@ import { TinodeClient, TinodeMessage, TinodeClientOptions } from './tinode-clien
 const DEDUP_STATE_DIR = path.join(os.homedir(), '.openclaw', 'imclaw');
 const DEDUP_STATE_PATH = path.join(DEDUP_STATE_DIR, 'dedup-state.json');
 
+/** Pull mention UIDs from message content or head. Tolerates both string[] and comma-joined string. */
+function extractMentions(content: any, head?: Record<string, any>): string[] {
+  const collect = (raw: unknown): string[] => {
+    if (Array.isArray(raw)) return raw.filter((v): v is string => typeof v === 'string' && v.length > 0);
+    if (typeof raw === 'string' && raw.trim()) {
+      return raw.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+    }
+    return [];
+  };
+  const fromHead = head ? collect(head.mentions) : [];
+  const fromContent = content && typeof content === 'object' ? collect(content.mentions) : [];
+  if (fromHead.length === 0 && fromContent.length === 0) return [];
+  return Array.from(new Set([...fromHead, ...fromContent]));
+}
+
 /** Persisted dedup store — tracks last seq per topic for duplicate detection, survives restarts */
 class MessageDedup {
   private seqs = new Map<string, number>();
@@ -98,6 +113,12 @@ export interface InboundMessage {
   seqId: number;
   timestamp: Date;
   isGroup: boolean;
+  /** UIDs explicitly mentioned by the sender (parsed from content.mentions or head.mentions). */
+  mentions: string[];
+  /** True if this agent's own UID appears in mentions. */
+  mentionsMe: boolean;
+  /** True if the sender marked this message as a round-closing summary (head.intent === 'summary'). */
+  isSummary: boolean;
 }
 
 export type MessageHandler = (message: InboundMessage) => void | Promise<void>;
@@ -127,6 +148,8 @@ export class ImclawBridge {
   private config: ChannelConfig;
   private messageHandler: MessageHandler | null = null;
   private temporaryListeners: TemporaryMessageListener[] = [];
+  /** Per-topic count of consecutive self-sends since the last inbound from someone else. */
+  private consecutiveSelfSends = new Map<string, number>();
 
   constructor(config: ChannelConfig) {
     this.config = config;
@@ -150,6 +173,9 @@ export class ImclawBridge {
         return;
       }
 
+      // Reset consecutive-self-send counter: someone else is speaking on this topic.
+      this.consecutiveSelfSends.delete(msg.topic);
+
       // 2. Check last known seq for dedup
       const lastSeq = this.dedup.getLastSeq(msg.topic, config.clawId);
 
@@ -172,13 +198,21 @@ export class ImclawBridge {
       //    The since-seqid is synced to TinodeClient so reconnection uses incremental
       //    fetch instead of re-fetching the full limit.
 
+      const mentions = extractMentions(msg.content, msg.head);
+      const selfUid = this.client.getSelfUid();
+      const isGroup = msg.topic.startsWith('grp');
+      const isSummary = isGroup && msg.head?.intent === 'summary';
+
       const inbound: InboundMessage = {
         topic: msg.topic,
         from: msg.from,
         content: msg.content,
         seqId: msg.seqId,
         timestamp: msg.timestamp,
-        isGroup: msg.topic.startsWith('grp'),
+        isGroup,
+        mentions,
+        mentionsMe: !!selfUid && mentions.includes(selfUid),
+        isSummary,
       };
 
       // Check temporary listeners first (reverse order, one-shot)
@@ -251,8 +285,17 @@ export class ImclawBridge {
     return resolved;
   }
 
-  async sendMessage(topicName: string, content: any): Promise<number> {
-    return this.client.sendMessage(topicName, content);
+  async sendMessage(topicName: string, content: any, head?: Record<string, any>): Promise<number> {
+    const seq = await this.client.sendMessage(topicName, content, head);
+    if (topicName.startsWith('grp')) {
+      this.consecutiveSelfSends.set(topicName, (this.consecutiveSelfSends.get(topicName) ?? 0) + 1);
+    }
+    return seq;
+  }
+
+  /** How many times we've sent in a row to this topic without anyone else speaking. */
+  getConsecutiveSelfSends(topic: string): number {
+    return this.consecutiveSelfSends.get(topic) ?? 0;
   }
 
   async uploadFile(fileBuffer: Buffer, filename: string, mime?: string): Promise<UploadResult> {

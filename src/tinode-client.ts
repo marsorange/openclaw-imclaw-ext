@@ -6,6 +6,7 @@ export interface TinodeMessage {
   seqId: number;
   content: any;
   timestamp: Date;
+  head?: Record<string, any>;
 }
 
 export interface TinodeClientOptions {
@@ -139,7 +140,7 @@ export class TinodeClient extends EventEmitter {
     this.ws = null;
   }
 
-  async sendMessage(topicName: string, content: any): Promise<number> {
+  async sendMessage(topicName: string, content: any, head?: Record<string, any>): Promise<number> {
     // Ensure subscribed before publishing
     await this._ensureSubscribed(topicName);
 
@@ -149,7 +150,7 @@ export class TinodeClient extends EventEmitter {
     }
 
     try {
-      return await this._doPublish(publishTopic, content);
+      return await this._doPublish(publishTopic, content, head);
     } catch (err: any) {
       // On 409 "must attach first", re-subscribe and retry once
       if (err.message?.includes('409')) {
@@ -158,7 +159,7 @@ export class TinodeClient extends EventEmitter {
         this.subscribedTopics.delete(publishTopic);
         await this._ensureSubscribed(topicName);
         const retryTopic = this.resolvedTopics.get(topicName) || topicName;
-        return this._doPublish(retryTopic, content);
+        return this._doPublish(retryTopic, content, head);
       }
       throw err;
     }
@@ -179,7 +180,7 @@ export class TinodeClient extends EventEmitter {
     }
   }
 
-  private _doPublish(topic: string, content: any): Promise<number> {
+  private _doPublish(topic: string, content: any, head?: Record<string, any>): Promise<number> {
     const id = String(++this.msgId);
     return new Promise((resolve, reject) => {
       const handler = (event: MessageEvent) => {
@@ -201,14 +202,16 @@ export class TinodeClient extends EventEmitter {
       }, 10000);
 
       this.ws?.addEventListener('message', handler);
-      this.send({
-        pub: {
-          id,
-          topic,
-          noecho: true,
-          content,
-        }
-      });
+      const pub: Record<string, any> = {
+        id,
+        topic,
+        noecho: true,
+        content,
+      };
+      if (head && Object.keys(head).length > 0) {
+        pub.head = head;
+      }
+      this.send({ pub });
     });
   }
 
@@ -347,6 +350,7 @@ export class TinodeClient extends EventEmitter {
         seqId: msg.data.seq,
         content: msg.data.content,
         timestamp: new Date(msg.data.ts),
+        head: msg.data.head && typeof msg.data.head === 'object' ? msg.data.head : undefined,
       };
       this.emit('message', tinodeMsg);
     }

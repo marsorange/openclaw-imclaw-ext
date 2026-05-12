@@ -48,6 +48,20 @@ function validateHttpUrl(url: string, label: string): void {
   }
 }
 
+// ─── Group reply rules ───
+// Injected as UntrustedContext on every group dispatch. The agent applies these
+// in priority order to decide whether to reply.
+const GROUP_REPLY_RULES = [
+  'You are in an IMClaw multi-agent group chat. Apply these reply rules in priority order:',
+  '1. If IsSummary=true on the incoming message, do NOT reply — the host has closed the round.',
+  '2. Otherwise if MentionsMe=true on a fresh message, you must reply (briefly is fine, or hand off to a more suitable member). If the @mention is from history replay (more than 10 minutes old), only reply if the request is still actionable now.',
+  '3. Otherwise, reply only when you have substantive content from your own expertise. Stay silent if you would only echo, agree, or repeat something already said.',
+  'Hard limit: you may not send more than 2 consecutive messages without another member speaking — the platform will refuse further sends until someone else replies. If discussion has converged and you are the host, send a summary with kind="summary" instead.',
+].join('\n');
+
+/** Messages older than this on dispatch are treated as history replay; @mention rule softens. */
+const STALE_MENTION_THRESHOLD_MS = 10 * 60 * 1000;
+
 // ─── Module-level account registry ───
 
 interface ResolvedPluginConfig {
@@ -896,6 +910,28 @@ function registerMessageHandler(
     const doDispatch = async (sessionKey: string) => {
       thinkingErrorDetected = false;
 
+      const untrustedContext: string[] = [];
+      if (boundedSession.rolloverNotice) untrustedContext.push(boundedSession.rolloverNotice);
+      if (isGroup) {
+        untrustedContext.push(GROUP_REPLY_RULES);
+        const messageAgeMs = Date.now() - msg.timestamp.getTime();
+        const isStale = messageAgeMs > STALE_MENTION_THRESHOLD_MS;
+        if (msg.isSummary) {
+          untrustedContext.push(
+            'IsSummary=true on this message: the host has closed the round. Do not reply.',
+          );
+        } else if (msg.mentionsMe && !isStale) {
+          untrustedContext.push(
+            'MentionsMe=true on this message: you are required to respond (briefly is fine, or hand off if a member is more suitable).',
+          );
+        } else if (msg.mentionsMe && isStale) {
+          const ageMin = Math.round(messageAgeMs / 60000);
+          untrustedContext.push(
+            `MentionsMe=true but this message is ${ageMin} min old (likely history replay on subscribe). Reply only if the request is still actionable now; otherwise stay silent.`,
+          );
+        }
+      }
+
       const rawCtx = {
         Body: text || '',
         RawBody: text || '',
@@ -920,9 +956,10 @@ function registerMessageHandler(
         ReplyingToSenderId: msg.from,
         Timestamp: Date.now(),
         CommandAuthorized: true,
-        ...(boundedSession.rolloverNotice ? {
-          UntrustedContext: [boundedSession.rolloverNotice],
-        } : {}),
+        Mentions: msg.mentions,
+        MentionsMe: msg.mentionsMe,
+        IsSummary: msg.isSummary,
+        ...(untrustedContext.length > 0 ? { UntrustedContext: untrustedContext } : {}),
         ...(mediaUrl ? {
           MediaUrl: mediaUrl,
           MediaPath: localMediaPath || mediaUrl,

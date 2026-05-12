@@ -54,7 +54,10 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
       'The tool will automatically fuzzy-search your contacts to resolve the best match. ' +
       'If multiple contacts match, you\'ll be shown candidates to choose from. ' +
       'To send a file, provide the local file path in the "media" parameter.\n\n' +
-      'Set wait_reply=true to wait for the target\'s reply and return it (useful when you need to ask someone a question and bring the answer back).',
+      'Set wait_reply=true to wait for the target\'s reply and return it (useful when you need to ask someone a question and bring the answer back).\n\n' +
+      'Group-only fields:\n' +
+      '· mentions: list of member UIDs (usrXXX) to @mention. Mentioned members are required to respond — use this to direct a question or hand off a step. Do not @mention non-members.\n' +
+      '· kind="summary": mark this message as a host-issued round-closing summary. Other agents will NOT reply to a summary message — use it only when a discussion has converged. Summaries should not contain @mentions or open questions.',
     parameters: {
       type: 'object' as const,
       properties: {
@@ -70,6 +73,16 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
           type: 'string',
           description: 'Local file path to send as an attachment (e.g. /tmp/report.txt, /tmp/photo.png). The file will be uploaded and sent to the target.',
         },
+        mentions: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Group only. Member UIDs (usrXXX) to @mention. A mentioned member is expected to respond.',
+        },
+        kind: {
+          type: 'string',
+          enum: ['normal', 'summary'],
+          description: 'Group only. "summary" marks the message as a round-closing summary that other agents will not reply to. Default: "normal".',
+        },
         wait_reply: {
           type: 'boolean',
           description: 'If true, wait for the target to reply and return their response (timeout 60s). Default: false.',
@@ -81,7 +94,7 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
       },
       required: ['target'],
     },
-    async execute(_id: string, params: { target: string; text?: string; media?: string; wait_reply?: boolean; max_reply_chars?: number }, signal?: AbortSignal): Promise<ToolResult> {
+    async execute(_id: string, params: { target: string; text?: string; media?: string; mentions?: string[]; kind?: 'normal' | 'summary'; wait_reply?: boolean; max_reply_chars?: number }, signal?: AbortSignal): Promise<ToolResult> {
       try {
         const accountId = getFirstAccountId();
         if (!accountId) return textResult('Error: No active IMClaw account.');
@@ -187,6 +200,47 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
           }
         }
 
+        // Build per-message head (mentions + intent). Group-only.
+        const isGroup = topicId.startsWith('grp');
+        const head: Record<string, any> = {};
+        if (isGroup) {
+          if (Array.isArray(params.mentions) && params.mentions.length > 0) {
+            const cleanMentions = params.mentions.filter(
+              (m): m is string => typeof m === 'string' && /^usr[A-Za-z0-9_-]+$/.test(m),
+            );
+            if (cleanMentions.length === 0) {
+              return textResult(
+                'Error: mentions must be Tinode user UIDs (usrXXX). Names, claw IDs, and aliases are not accepted here. ' +
+                'Use imclaw_group_action or read recent group messages to resolve member UIDs first.',
+              );
+            }
+            if (cleanMentions.length < params.mentions.length) {
+              const dropped = params.mentions.filter((m) => !cleanMentions.includes(m as string));
+              return textResult(
+                `Error: ${dropped.length} of ${params.mentions.length} mentions are not valid UIDs (usrXXX): ${JSON.stringify(dropped)}. ` +
+                'Resolve all entries to UIDs before sending so every mention reaches its target.',
+              );
+            }
+            head.mentions = cleanMentions.join(',');
+          }
+          if (params.kind === 'summary') head.intent = 'summary';
+        } else if (params.mentions?.length || params.kind === 'summary') {
+          return textResult('Error: mentions and kind="summary" are only valid in group chats.');
+        }
+
+        // Hard guard against runaway self-talk in groups: refuse if we've already
+        // sent twice in a row to this group with no other speaker in between.
+        // Summaries are exempt — they are intentionally one-sided closers.
+        if (isGroup && head.intent !== 'summary') {
+          const consecutive = bridge.getConsecutiveSelfSends(topicId);
+          if (consecutive >= 2) {
+            return textResult(
+              `Error: you've already sent ${consecutive} consecutive messages to ${topicId} without anyone else replying. ` +
+              'Wait for another member to speak before continuing — or, if you are the host and the discussion is done, send a summary with kind="summary" to close the round.'
+            );
+          }
+        }
+
         // Set up reply listener BEFORE sending (to avoid missing fast replies)
         let replyPromise: Promise<string | null> | undefined;
         if (params.wait_reply) {
@@ -232,7 +286,7 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
 
         // Send text if provided
         if (params.text?.trim()) {
-          await bridge.sendMessage(topicId, params.text.trim());
+          await bridge.sendMessage(topicId, params.text.trim(), Object.keys(head).length > 0 ? head : undefined);
           results.push(`text sent`);
         }
 
