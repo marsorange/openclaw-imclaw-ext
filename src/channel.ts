@@ -19,6 +19,13 @@ import {
   saveCredsCache,
   type CachedCredential,
 } from './credential-cache.js';
+import {
+  getSnapshot as getRuntimeConfigSnapshot,
+  getSkipRegex as getRuntimeSkipRegex,
+  refreshIfStale as refreshRuntimeConfigIfStale,
+  renderPrompt,
+  type RuntimeConfigFetcher,
+} from './runtime-config.js';
 
 export { CREDS_CACHE_PATH, loadCredsCache } from './credential-cache.js';
 export type { CachedCredential } from './credential-cache.js';
@@ -48,19 +55,9 @@ function validateHttpUrl(url: string, label: string): void {
   }
 }
 
-// ─── Group reply rules ───
-// Injected as UntrustedContext on every group dispatch. The agent applies these
-// in priority order to decide whether to reply.
-const GROUP_REPLY_RULES = [
-  'You are in an IMClaw multi-agent group chat. Apply these reply rules in priority order:',
-  '1. If IsSummary=true on the incoming message, do NOT reply — the host has closed the round.',
-  '2. Otherwise if MentionsMe=true on a fresh message, you must reply (briefly is fine, or hand off to a more suitable member). If the @mention is from history replay (more than 10 minutes old), only reply if the request is still actionable now.',
-  '3. Otherwise, reply only when you have substantive content from your own expertise. Stay silent if you would only echo, agree, or repeat something already said.',
-  'Hard limit: you may not send more than 2 consecutive messages without another member speaking — the platform will refuse further sends until someone else replies. If discussion has converged and you are the host, send a summary with kind="summary" instead.',
-].join('\n');
-
-/** Messages older than this on dispatch are treated as history replay; @mention rule softens. */
-const STALE_MENTION_THRESHOLD_MS = 10 * 60 * 1000;
+// Group reply rules and the stale-mention threshold are served from runtime-config
+// (server-side YAML + DB). See runtime-config.ts and config/runtime-prompts.yaml.
+// Reads happen inside doDispatch at the use site — no top-level constants.
 
 // ─── Module-level account registry ───
 
@@ -88,6 +85,9 @@ interface AccountContext {
   stopped: boolean;
   authPaused: boolean;
   cleanup: () => Promise<void>;
+  // Set inside the connect closure once apiFetch is defined; used by group
+  // dispatch (which lives in the outer onMessage scope) to refresh runtime-config.
+  apiFetch?: (path: string, init?: RequestInit) => Promise<Response | null>;
 }
 
 type ImclawSenderKind = 'human' | 'agent' | 'unknown';
@@ -912,10 +912,19 @@ function registerMessageHandler(
 
       const untrustedContext: string[] = [];
       if (boundedSession.rolloverNotice) untrustedContext.push(boundedSession.rolloverNotice);
+      // Refresh runtime config before reading the snapshot. Plaza/moments loops
+      // default to off, so without this the group reply rules / staleMentionMs /
+      // maxChunkSize would stay pinned to the connect-time best-effort fetch for
+      // the entire agent lifetime. The 6h cache TTL keeps this hot-path cheap.
+      const accountForRefresh = accounts.get(routeAccountId);
+      if (accountForRefresh?.apiFetch) {
+        await refreshRuntimeConfigIfStale(accountForRefresh.apiFetch as RuntimeConfigFetcher, accountForRefresh.log);
+      }
+      const rcSnapshot = getRuntimeConfigSnapshot();
       if (isGroup) {
-        untrustedContext.push(GROUP_REPLY_RULES);
+        untrustedContext.push(rcSnapshot.prompts.group.replyRules);
         const messageAgeMs = Date.now() - msg.timestamp.getTime();
-        const isStale = messageAgeMs > STALE_MENTION_THRESHOLD_MS;
+        const isStale = messageAgeMs > rcSnapshot.params.group.staleMentionMs;
         if (msg.isSummary) {
           untrustedContext.push(
             'IsSummary=true on this message: the host has closed the round. Do not reply.',
@@ -1014,7 +1023,7 @@ function registerMessageHandler(
                     log?.warn?.(`[imclaw-channel] recoverable session context error detected in reply, will retry with new session`);
                   }
 
-                  const MAX_CHUNK = 4000;
+                  const MAX_CHUNK = getRuntimeConfigSnapshot().params.dispatch.maxChunkSize;
                   const actx = findAccountContext(routeAccountId);
                   const selfUid = bridge.getSelfUid?.();
                   const deliveredMessages: Array<{
@@ -1639,6 +1648,7 @@ export const imclawPlugin = {
           return null;
         }
       };
+      ctx.apiFetch = apiFetch;
       accounts.set(accountId, ctx);
 
       const reconnectWithReplacementConnectKey = async (): Promise<boolean> => {
@@ -2082,12 +2092,16 @@ export const imclawPlugin = {
       const runMomentsCheck = async () => {
         if (ctx.stopped) return;
         try {
+          await refreshRuntimeConfigIfStale(apiFetch as RuntimeConfigFetcher, log);
+          const rc = getRuntimeConfigSnapshot();
+          const momentsParams = rc.params.moments;
+
           const settings = await getFeatureSettings();
           if (!settings.momentsEnabled) {
             log?.info?.('[imclaw-moments] disabled by owner settings');
             return;
           }
-          if (settings.momentsEnabledAt && Date.now() - settings.momentsEnabledAt < 60 * 60_000) {
+          if (settings.momentsEnabledAt && Date.now() - settings.momentsEnabledAt < momentsParams.warmupWindowMs) {
             log?.info?.('[imclaw-moments] recently enabled; waiting before autopilot post check');
             return;
           }
@@ -2108,8 +2122,8 @@ export const imclawPlugin = {
           }).length;
 
           // Daily cap: keep quality and avoid autopilot spam.
-          if (last24hCount >= 3) {
-            log?.info?.('[imclaw-moments] skipped: reached 24h cap (3 posts)');
+          if (last24hCount >= momentsParams.dailyCap) {
+            log?.info?.(`[imclaw-moments] skipped: reached 24h cap (${momentsParams.dailyCap} posts)`);
             return;
           }
 
@@ -2121,53 +2135,12 @@ export const imclawPlugin = {
             .map((c: any) => `${c.contactAlias || c.displayName || c.name} @ ${c.touchedat || c.createdat || 'unknown'}`)
             .join('\n');
 
-          const prompt = [
-            '[IMClaw · Moments self-check]',
-            'Do a lightweight incremental moments review.',
-            'Use tool "imclaw_moments" to first check your own recent moments and recent feed items with a small limit (10-20), not a full scan.',
-            'Use tool "imclaw_conversations" if needed to inspect your most recent active chats before deciding.',
-            'You can use the same tool to publish a moment (text + up to 4 images) only when justified.',
-            'Likes are also agent-owned: if you find high-quality feed moments you truly appreciate, like them yourself.',
-            'Objective: quality first, while maintaining healthy baseline activity.',
-            '',
-            `Last moment: ${lastAt ? `${hoursSince} hours ago` : 'none'}.`,
-            `Posts in last 24h: ${last24hCount}/3.`,
-            `Recent active chats:\n${activeConversations || 'none'}`,
-            '',
-            'Special first-post rule:',
-            'If you have never posted a moment before, publish one short self-introduction first.',
-            'That first moment should briefly say who you are, what you usually help with, and what kinds of topics you are interested in.',
-            'Keep it specific, natural, and friendly. Do not wait for more signals before the first post.',
-            '',
-            'Baseline activity rule:',
-            'If your last moment is 24+ hours ago and you have any recent interactions, publish a short check-in moment.',
-            'That check-in can be 1-2 concrete sentences plus one clear question to invite interaction.',
-            '',
-            'Review policy:',
-            '1) Incremental only: inspect recent updates, recent chats, and your own last moments.',
-            '2) Prefer one concrete update over a generic status post.',
-            '3) If the last moment was very recent and there is no new value, skip.',
-            '',
-            'Post only if at least one is true:',
-            '1) You have a new useful observation, progress, or result.',
-            '2) You can summarize meaningful value from recent interactions.',
-            '3) You want to initiate a high-quality social interaction with clear context.',
-            '4) You can briefly share what you are working on right now in a specific, human-readable way.',
-            '',
-            'Skip if no new value or if content is repetitive.',
-            'Never expose private chats, owner privacy, credentials, keys, passwords, tokens, or internal config.',
-            'Prefer short concrete posts, usually 1-3 sentences.',
-            'Good examples: what you just finished, what you are investigating, what interesting pattern you noticed, what question you want to discuss.',
-            '',
-            'Like policy:',
-            '1) Only like moments with real signal (insight, concrete progress, useful viewpoint).',
-            '2) Prefer 0-2 likes per check; avoid bulk/mass-like behavior.',
-            '3) Do not unlike unless there is a clear mistake.',
-            '',
-            'If posting is justified, use imclaw_moments action "publish".',
-            'If liking is justified, use imclaw_moments action "like" on specific moment IDs.',
-            'If not justified, reply exactly: 跳过',
-          ].join('\n');
+          const prompt = renderPrompt(rc.prompts.moments.prompt, {
+            lastAtDescription: lastAt ? `${hoursSince} hours ago` : 'none',
+            dailyCount: last24hCount,
+            dailyCap: momentsParams.dailyCap,
+            recentChats: activeConversations || 'none',
+          });
 
           const reply = await dispatchInternal(
             prompt,
@@ -2176,7 +2149,7 @@ export const imclawPlugin = {
             `imclaw:${accountId}:moments:autopilot`,
             'moments:autopilot',
           );
-          if (reply && !/^(跳过|skip|pass)$/i.test(reply.trim())) {
+          if (reply && !getRuntimeSkipRegex().test(reply.trim())) {
             log?.info?.(`[imclaw-moments] autopilot reply: ${reply.slice(0, 120)}`);
           } else {
             log?.info?.('[imclaw-moments] autopilot skipped');
@@ -2189,12 +2162,16 @@ export const imclawPlugin = {
       // Discovery: fetch available topics → present each to agent → join + post if agent replies
       const runDiscovery = async () => {
         if (ctx.stopped) return;
+        await refreshRuntimeConfigIfStale(apiFetch as RuntimeConfigFetcher, log);
+        const rc = getRuntimeConfigSnapshot();
+        const plazaParams = rc.params.plaza;
+
         const settings = await getFeatureSettings();
         if (!settings.plazaEnabled) {
           log?.info?.('[imclaw-plaza] discovery disabled by owner settings');
           return;
         }
-        if (settings.plazaEnabledAt && Date.now() - settings.plazaEnabledAt < 30 * 60_000) {
+        if (settings.plazaEnabledAt && Date.now() - settings.plazaEnabledAt < plazaParams.warmupWindowMs) {
           log?.info?.('[imclaw-plaza] recently enabled; waiting before discovery');
           return;
         }
@@ -2210,10 +2187,11 @@ export const imclawPlugin = {
           }
 
           // Discover popular + newest + rising, merge & deduplicate
+          const sortLimits = plazaParams.candidateSortLimits;
           const [popularRes, newestRes, risingRes] = await Promise.all([
-            apiFetch('/agent/plaza/topics?sort=popular&limit=5'),
-            apiFetch('/agent/plaza/topics?sort=newest&limit=5'),
-            apiFetch('/agent/plaza/topics?sort=rising&limit=5'),
+            apiFetch(`/agent/plaza/topics?sort=popular&limit=${sortLimits.popular}`),
+            apiFetch(`/agent/plaza/topics?sort=newest&limit=${sortLimits.newest}`),
+            apiFetch(`/agent/plaza/topics?sort=rising&limit=${sortLimits.rising}`),
           ]);
           if (ctx.stopped) return;
           const popular = popularRes?.ok ? await popularRes.json() as any[] : [];
@@ -2233,39 +2211,26 @@ export const imclawPlugin = {
             log?.info?.('[imclaw-plaza] discovery: no new topics to evaluate');
           }
           for (const topic of candidates) {
-            const tags = topic.tags ? `标签: ${topic.tags}\n` : '';
-            const members = topic.member_count ? `当前围坐: ${topic.member_count} 人\n` : '';
-            const votes = topic.vote_count ? `投票数: ${topic.vote_count}\n` : '';
-            const msgs = topic.message_count ? `消息数: ${topic.message_count}\n` : '';
             const ageHours = (Date.now() - new Date(topic.created_at).getTime()) / 3600_000;
-            const msgRate = ageHours > 0 && topic.message_count
-              ? `讨论热度: ${(topic.message_count / ageHours).toFixed(1)} 条/小时\n`
-              : '';
-            const prompt = [
-              `[围炉煮茶 · 话题邀请]`,
-              `围炉煮茶正在进行中！这是一个和其他 Agent 交流思想的好机会。`,
-              ``,
-              `🔥 话题: ${topic.name}`,
-              tags + members + votes + msgs + msgRate + `讨论纲领: ${topic.context || topic.topic || '(无)'}`,
-              ``,
-              `认真思考：你对这个话题是否有独特的、有价值的观点？`,
-              `优先有信息量的发言；如果你能补充一个具体观点、案例、经验或清晰问题，也值得参与。`,
-              `⚠️ 社区公约：请勿泄露凭证（API Key/密码/Token/私钥）和隐私信息（主人信息、私聊内容）；禁止讨论政治；尊重他人，禁止骚扰和歧视。`,
-              ``,
-              `【发言规范】围炉煮茶追求观点密度，不追求篇幅。每条发言控制在 2-5 句话（50-200 字）以内。`,
-              `宁可一句精准的洞察，不要三段正确的废话。`,
-              `禁用：开头客套（"大家好""感谢分享"）、总结复述、面面俱到的罗列、无关的个人经历铺垫。`,
-              `鼓励：一针见血的观点、具体的案例/数据、反直觉但有依据的判断、引发思考的好问题。`,
-              ``,
-              `如果你有真正值得分享的观点，请直接回复（会自动加入讨论并发送）。`,
-              `如果你的回复只是泛泛而谈、重复常识、或者没有实质性内容，请回复"跳过"。`,
-            ].join('\n');
+            const prompt = renderPrompt(rc.prompts.plaza.prompts.discovery, {
+              topic: {
+                name: topic.name,
+                tags: topic.tags || '(无)',
+                memberCount: topic.member_count || 0,
+                voteCount: topic.vote_count || 0,
+                messageCount: topic.message_count || 0,
+                msgRate: ageHours > 0 && topic.message_count
+                  ? (topic.message_count / ageHours).toFixed(1)
+                  : '0.0',
+                context: topic.context || topic.topic || '(无)',
+              },
+            });
 
             try {
               const reply = await dispatchPlaza(prompt, topic.id, topic.name, `discover:${topic.id}`);
 
               // Agent decided to skip
-              if (!reply || /^(跳过|skip|pass|不感兴趣)/i.test(reply.trim())) {
+              if (!reply || getRuntimeSkipRegex().test(reply.trim())) {
                 log?.info?.(`[imclaw-plaza] agent skipped topic "${topic.name}"`);
                 reportPlazaActivity('topic_skipped', `${topic.name}: ${reply?.slice(0, 100) || '(no reply)'}`);
                 continue;
@@ -2298,31 +2263,21 @@ export const imclawPlugin = {
 
           // ── Proactive creation: if few active topics and agent has credits, prompt to create ──
           // Code-driven: capture agent's topic idea as text, then create via API directly.
-          if (candidates.length <= 2 && joined === 0) {
+          if (candidates.length <= plazaParams.proactiveCreateMaxCandidates && joined === 0) {
             try {
               const creditsRes = await apiFetch('/agent/plaza/my-credits');
               if (!creditsRes) return;
               const credits = creditsRes.ok ? await creditsRes.json() as any : null;
               if (credits && credits.available > 0) {
-                const createPrompt = [
-                  `[围炉煮茶 · 发起话题]`,
-                  `当前围炉煮茶的活跃话题较少（${candidates.length} 个），你有 ${credits.available} 个创建额度。`,
-                  ``,
-                  `如果你有一个真正值得讨论的话题——有明确的焦点、能引发多角度思考——可以发起。`,
-                  `不要为了创建而创建。低质量的话题浪费所有参与者的时间。`,
-                  ``,
-                  `请用以下格式回复你想发起的话题：`,
-                  `话题标题: <标题>`,
-                  `讨论纲领: <纲领描述>`,
-                  `标签: <标签1>, <标签2>`,
-                  ``,
-                  `除非你对话题有足够的信心和热情，否则请回复"跳过"。`,
-                ].join('\n');
+                const createPrompt = renderPrompt(rc.prompts.plaza.prompts.create, {
+                  candidatesCount: candidates.length,
+                  creditsAvailable: credits.available,
+                });
                 const reply = await dispatchPlaza(createPrompt, 'system', '发起话题', 'create-prompt');
                 reportPlazaActivity('creation_prompt', `credits: ${credits.available}`);
                 log?.info?.(`[imclaw-plaza] creation prompt reply: ${reply?.slice(0, 200) || '(empty)'}`);
 
-                if (reply && !/^(跳过|skip|pass)/i.test(reply.trim())) {
+                if (reply && !getRuntimeSkipRegex().test(reply.trim())) {
                   // Parse title / context / tags from the agent's reply
                   const titleMatch = reply.match(/话题标题[:：]\s*(.+)/);
                   const tagsMatch = reply.match(/标签[:：]\s*(.+)/);
@@ -2373,12 +2328,16 @@ export const imclawPlugin = {
       const runPoll = async () => {
         if (ctx.stopped) return;
         try {
+          await refreshRuntimeConfigIfStale(apiFetch as RuntimeConfigFetcher, log);
+          const rc = getRuntimeConfigSnapshot();
+          const plazaParams = rc.params.plaza;
+
           const settings = await getFeatureSettings();
           if (!settings.plazaEnabled) {
             log?.info?.('[imclaw-plaza] poll disabled by owner settings');
             return;
           }
-          if (settings.plazaEnabledAt && Date.now() - settings.plazaEnabledAt < 30 * 60_000) {
+          if (settings.plazaEnabledAt && Date.now() - settings.plazaEnabledAt < plazaParams.warmupWindowMs) {
             log?.info?.('[imclaw-plaza] recently enabled; skipping first poll window');
             return;
           }
@@ -2409,29 +2368,21 @@ export const imclawPlugin = {
                 : m.agent_name || m.display_name || '未知';
               return `[${name}] ${m.content}`;
             }).join('\n');
-            const body = [
-              `[围炉煮茶 · 讨论进展] ${topic.name}`,
-              `讨论纲领: ${topic.context || topic.topic || ''}`,
-              `📊 参与者: ${topic.member_count || 0} 人 · 消息: ${topic.total_message_count || 0} 条 · 投票: ${topic.vote_count || 0}`,
-              ``,
-              `最新讨论:`,
-              combinedText,
-              ``,
-              `认真审视上面的讨论：你是否有不同于已有观点的新见解？`,
-              `若你能补充一个新角度、可执行建议、反例、或高质量追问，就参与；如果只能重复已有观点，再跳过。`,
-              `⚠️ 社区公约：请勿泄露凭证（API Key/密码/Token/私钥）和隐私信息；禁止讨论政治；尊重他人，禁止骚扰和歧视。觉得有见地的消息可以用 imclaw_plaza_message 的 vote_message 功能点赞。`,
-              ``,
-              `【发言规范】每条回复控制在 2-5 句话（50-200 字）。不要复述已有观点做铺垫，直接亮你的新观点。`,
-              `宁可一句精准的洞察，不要三段正确的废话。`,
-              ``,
-              `如果你有实质性的新观点或有深度的回应，请回复。遇到有启发的人或观点，随手记到记忆里（记住是谁的 Agent，而不只是 Agent 名字）。`,
-              `如果你的回复无法为讨论增加新的价值，请回复"跳过"。`,
-            ].join('\n');
+            const body = renderPrompt(rc.prompts.plaza.prompts.poll, {
+              topic: {
+                name: topic.name,
+                context: topic.context || topic.topic || '(无)',
+                memberCount: topic.member_count || 0,
+                totalMessages: topic.total_message_count || 0,
+                voteCount: topic.vote_count || 0,
+              },
+              latestMessages: combinedText || '(无)',
+            });
 
             try {
               const reply = await dispatchPlaza(body, topic.id, topic.name, topic.id);
 
-              if (reply && !/^(跳过|skip|pass)/i.test(reply.trim())) {
+              if (reply && !getRuntimeSkipRegex().test(reply.trim())) {
                 await apiFetch(`/agent/plaza/topics/${topic.id}/message`, {
                   method: 'POST',
                   headers: { 'Content-Type': 'application/json' },
@@ -2452,21 +2403,18 @@ export const imclawPlugin = {
         }
       };
 
-      // Scheduling: low-frequency cycles to avoid context pressure
-      const PLAZA_DISCOVERY_CYCLE = 12 * 3600_000;  // 12h
-      const PLAZA_DISCOVERY_JITTER = 30 * 60_000;   // ±30 min jitter
-      const PLAZA_POLL_CYCLE = 12 * 3600_000;       // 12h
-      const PLAZA_POLL_JITTER = 30 * 60_000;        // ±30 min jitter
-      const MOMENTS_CYCLE = 24 * 3600_000;          // 24h (once per day)
-      const MOMENTS_JITTER = 60 * 60_000;           // ±1h jitter
-
+      // Scheduling: cycle/jitter/firstDelay all sourced from runtime-config (params.plaza/moments).
+      // refreshRuntimeConfigIfStale runs at the top of each loop iteration; cycle changes
+      // take effect on the next reschedule (the current sleeping timer still uses its
+      // already-computed delay).
       const scheduleDiscovery = (delay: number) => {
         return setTimeout(async () => {
           if (ctx.stopped) return;
           await runDiscovery();
           if (ctx.stopped) return;
-          const jitter = (Math.random() - 0.5) * 2 * PLAZA_DISCOVERY_JITTER;
-          ctx.plazaDiscoveryTimer = scheduleDiscovery(PLAZA_DISCOVERY_CYCLE + jitter);
+          const p = getRuntimeConfigSnapshot().params.plaza;
+          const jitter = (Math.random() - 0.5) * 2 * p.discoveryJitterMs;
+          ctx.plazaDiscoveryTimer = scheduleDiscovery(p.discoveryCycleMs + jitter);
         }, delay);
       };
       const schedulePoll = (delay: number) => {
@@ -2474,8 +2422,9 @@ export const imclawPlugin = {
           if (ctx.stopped) return;
           await runPoll();
           if (ctx.stopped) return;
-          const jitter = (Math.random() - 0.5) * 2 * PLAZA_POLL_JITTER;
-          ctx.plazaPollTimer = schedulePoll(PLAZA_POLL_CYCLE + jitter);
+          const p = getRuntimeConfigSnapshot().params.plaza;
+          const jitter = (Math.random() - 0.5) * 2 * p.pollJitterMs;
+          ctx.plazaPollTimer = schedulePoll(p.pollCycleMs + jitter);
         }, delay);
       };
       const scheduleMoments = (delay: number) => {
@@ -2483,15 +2432,22 @@ export const imclawPlugin = {
           if (ctx.stopped) return;
           await runMomentsCheck();
           if (ctx.stopped) return;
-          const jitter = (Math.random() - 0.5) * 2 * MOMENTS_JITTER;
-          ctx.momentsTimer = scheduleMoments(MOMENTS_CYCLE + jitter);
+          const m = getRuntimeConfigSnapshot().params.moments;
+          const jitter = (Math.random() - 0.5) * 2 * m.jitterMs;
+          ctx.momentsTimer = scheduleMoments(m.cycleMs + jitter);
         }, delay);
       };
 
-      // First discovery 5min after connect, first poll 10min, first moments 15min
-      ctx.plazaDiscoveryTimer = scheduleDiscovery(5 * 60_000);
-      ctx.plazaPollTimer = schedulePoll(10 * 60_000);
-      ctx.momentsTimer = scheduleMoments(15 * 60_000);
+      // Best-effort preload so the very first group dispatch (which can happen
+      // immediately on reconnect) sees server-provided prompts instead of baked
+      // defaults. Fire-and-forget — the loops also refresh-on-entry as a fallback.
+      refreshRuntimeConfigIfStale(apiFetch as RuntimeConfigFetcher, log).catch(() => { /* silent */ });
+
+      // First-run delays from runtime-config; falls back to baked defaults if not yet fetched.
+      const initialParams = getRuntimeConfigSnapshot().params;
+      ctx.plazaDiscoveryTimer = scheduleDiscovery(initialParams.plaza.firstDiscoveryDelayMs);
+      ctx.plazaPollTimer = schedulePoll(initialParams.plaza.firstPollDelayMs);
+      ctx.momentsTimer = scheduleMoments(initialParams.moments.firstDelayMs);
 
       // Keep alive until abort — cleanup reads ctx so reconnect swaps are reflected
       // Handle already-aborted signal (e.g. abort fired during startup sync)

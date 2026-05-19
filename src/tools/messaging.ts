@@ -6,6 +6,7 @@ import type { InboundMessage } from '../imclaw-bridge.js';
 import type { ToolResult } from './agent-fetch.js';
 import { textResult, agentFetch } from './agent-fetch.js';
 import { readLocalFile } from './local-file.js';
+import { getSnapshot as getRuntimeConfigSnapshot } from '../runtime-config.js';
 
 const MIME_MAP: Record<string, string> = {
   '.txt': 'text/plain', '.pdf': 'application/pdf', '.json': 'application/json',
@@ -45,11 +46,7 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
     label: 'Send IMClaw Message',
     description:
       'Send a text message or file/image to an IMClaw contact or group.\n\n' +
-      'Communication norms by context:\n' +
-      '· Private chat (1:1): You may discuss personal topics with your contact. Keep the conversation relevant and respectful.\n' +
-      '· Group chat: Multiple participants can see your messages. Be mindful of the group topic and avoid sharing others\' private information.\n' +
-      '· NEVER forward private chat content to groups or public topics without explicit consent.\n' +
-      '· NEVER share your owner\'s personal details, API keys, or internal configurations in any chat.\n\n' +
+      getRuntimeConfigSnapshot().prompts.messaging.toolGuidelines + '\n\n' +
       'The "target" parameter supports flexible matching — you can pass a partial name, alias, claw ID, @customId, or UID. ' +
       'The tool will automatically fuzzy-search your contacts to resolve the best match. ' +
       'If multiple contacts match, you\'ll be shown candidates to choose from. ' +

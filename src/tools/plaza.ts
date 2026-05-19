@@ -1,6 +1,7 @@
 import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import type { ToolResult } from './agent-fetch.js';
 import { textResult, agentFetch } from './agent-fetch.js';
+import { getSnapshot as getRuntimeConfigSnapshot } from '../runtime-config.js';
 
 function clampInt(value: unknown, fallback: number, min: number, max: number): number {
   const n = typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : fallback;
@@ -42,14 +43,7 @@ export function registerPlazaTools(api: OpenClawPluginApi): void {
     label: 'IMClaw Topic Plaza',
     description:
       'Discover and manage public topics in the IMClaw Topic Plaza (围炉煮茶).\n\n' +
-      '⚠️ IMPORTANT: This is a PUBLIC forum. You MUST follow the community guidelines:\n' +
-      '- NEVER share credentials (API keys, tokens, passwords, private keys, connection strings)\n' +
-      '- NEVER discuss politics or express political positions\n' +
-      '- Respect all participants — no harassment, insults, or personal attacks\n' +
-      '- Do not disclose private information (owner details, phone numbers, addresses, private chats)\n' +
-      '- Stay on topic; read existing messages before posting to avoid repetition\n' +
-      '- Be truthful — do not fabricate facts or cite non-existent sources\n' +
-      '- Full community guidelines: see SKILL.md "Community Guidelines" section\n\n' +
+      getRuntimeConfigSnapshot().prompts.plaza.toolGuidelines + '\n\n' +
       'Actions:\n' +
       '- "list": Browse active topics (sort by newest/popular/expiring/rising/most_voted, filter by tags)\n' +
       '- "detail": Get topic info + members\n' +
@@ -211,13 +205,7 @@ export function registerPlazaTools(api: OpenClawPluginApi): void {
     label: 'IMClaw Topic Messages',
     description:
       'Read, post, and vote on messages in an IMClaw Topic Plaza topic.\n\n' +
-      '⚠️ IMPORTANT: All messages are PUBLIC. Community guidelines apply:\n' +
-      '- NEVER include credentials (API keys, tokens, passwords, private keys) in messages\n' +
-      '- NEVER discuss politics or express political positions\n' +
-      '- No harassment, insults, discrimination, or spam\n' +
-      '- Do not disclose private info (owner details, phone numbers, private chats)\n' +
-      '- Stay on topic, be truthful, respect copyrights\n' +
-      '- Upvote insightful messages to help surface quality content\n\n' +
+      getRuntimeConfigSnapshot().prompts.plaza.toolGuidelines + '\n\n' +
       'Actions:\n' +
       '- "read": Get messages from a topic (supports pagination with since/limit)\n' +
       '- "post": Post a message to a topic (must be a member; cooldown and per-topic cap are enforced server-side)\n' +

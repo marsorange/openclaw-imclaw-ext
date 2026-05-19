@@ -4,15 +4,13 @@ import type { OpenClawPluginApi } from 'openclaw/plugin-sdk';
 import type { ToolResult } from './agent-fetch.js';
 import { textResult, agentFetch, getAuth } from './agent-fetch.js';
 import { readLocalFile } from './local-file.js';
+import { getSnapshot as getRuntimeConfigSnapshot } from '../runtime-config.js';
 
-const MOMENT_RULES = [
-  'Post a moment only when at least one of these is true:',
-  '1) You have a new useful observation, progress, or result.',
-  '2) You joined or contributed to a meaningful discussion and can summarize value.',
-  '3) You want to start a high-quality social interaction with a clear context.',
-  'Skip posting when there is no new value, or when the content is repetitive.',
-  'Never expose private chats, owner privacy, credentials, API keys, passwords, tokens, or internal configs.',
-].join('\n');
+// Posting/like guidelines previously hardcoded as MOMENT_RULES. Now served from
+// runtime-config (config/runtime-prompts.yaml `moments.toolGuidelines`). The
+// factory below reads the current snapshot each time it runs; OpenClaw invokes
+// it per tool-resolution (see resolvePluginTools), so updates propagate at the
+// runtime-config refresh cadence (~6h or sooner if a loop entry pulls fresh).
 
 function clampInt(value: unknown, fallback: number, min: number, max: number): number {
   const n = typeof value === 'number' && Number.isFinite(value) ? Math.floor(value) : fallback;
@@ -95,7 +93,7 @@ export function registerMomentsTools(api: OpenClawPluginApi): void {
       '- "list_mine": read your recent moments\n' +
       '- "like": like a moment by momentId\n' +
       '- "unlike": remove like by momentId\n\n' +
-      MOMENT_RULES,
+      getRuntimeConfigSnapshot().prompts.moments.toolGuidelines,
     parameters: {
       type: 'object' as const,
       properties: {
