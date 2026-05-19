@@ -124,17 +124,39 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
             }
           }
 
-          // Try contacts first (skip if already resolved by "owner")
+          // Try contacts first (skip if already resolved by "owner").
+          // Collect ALL exact-match contacts; if more than one matches the
+          // same name token, refuse rather than silently picking the first.
+          // Otherwise distinct people who share a display name (e.g. two
+          // friends both with agent_name="二饼") route to whichever PG
+          // happened to return first.
           if (topicId === target) {
             const contactRes = await agentFetch('/agent/contacts', { signal });
             if (contactRes.ok) {
               const contacts = contactRes.data as any[];
-              const match = contacts.find((c: any) =>
-                [c.contact_agent_name, c.alias, c.contact_claw_name, c.contact_display_name, c.contact_claw_id]
-                  .some(f => f && f.toLowerCase() === normalized)
+              const matches = contacts.filter((c: any) =>
+                [
+                  c.claw_alias,
+                  c.contact_agent_name,
+                  c.alias,
+                  c.contact_claw_name,
+                  c.contact_display_name,
+                  c.contact_custom_id,
+                  c.contact_claw_id,
+                ].some(f => f && String(f).toLowerCase() === normalized)
               );
-              if (match?.contact_tinode_uid) {
-                topicId = match.contact_tinode_uid;
+              if (matches.length === 1 && matches[0].contact_tinode_uid) {
+                topicId = matches[0].contact_tinode_uid;
+              } else if (matches.length > 1) {
+                const candidates = matches.map((c: any) => {
+                  const name = c.claw_alias || c.contact_agent_name || c.contact_claw_name || c.alias || 'unknown';
+                  const clawId = c.contact_claw_id ? ` (${c.contact_claw_id})` : '';
+                  const customId = c.contact_custom_id ? ` @${c.contact_custom_id}` : '';
+                  return `  - ${name}${clawId}${customId} (uid: ${c.contact_tinode_uid})`;
+                }).join('\n');
+                return textResult(
+                  `"${target}" 在通讯录里精确命中了 ${matches.length} 个联系人，请用 CLAW-ID、@customId 或 UID 重新指定其中一个：\n${candidates}`
+                );
               }
             }
           }
@@ -173,13 +195,13 @@ export function registerMessagingTools(api: OpenClawPluginApi): void {
                 topicId = fuzzyMatches[0].contact_tinode_uid;
               } else if (fuzzyMatches.length > 1) {
                 const candidates = fuzzyMatches.map((c: any) => {
-                  const name = c.contact_agent_name || c.contact_claw_name || c.alias || 'unknown';
+                  const name = c.claw_alias || c.contact_agent_name || c.contact_claw_name || c.alias || 'unknown';
                   const clawId = c.contact_claw_id ? ` (${c.contact_claw_id})` : '';
                   const customId = c.contact_custom_id ? ` @${c.contact_custom_id}` : '';
                   return `  - ${name}${clawId}${customId} (uid: ${c.contact_tinode_uid})`;
                 }).join('\n');
                 return textResult(
-                  `"${target}" matched ${fuzzyMatches.length} contacts. Please specify one:\n${candidates}`
+                  `"${target}" matched ${fuzzyMatches.length} contacts. Please specify one by CLAW-ID, @customId or UID:\n${candidates}`
                 );
               }
             }

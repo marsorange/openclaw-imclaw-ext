@@ -82,6 +82,10 @@ interface AccountContext {
   mediaDir: string;
   configConnectKey: string | null;
   ownerTinodeUid: string | null;
+  // Last agent_name value successfully pushed to /agent/profile. Compared
+  // against the live openclaw config on every heartbeat tick so mid-session
+  // renames propagate without forcing the name into the heartbeat payload.
+  lastSyncedAgentName: string | null;
   stopped: boolean;
   authPaused: boolean;
   cleanup: () => Promise<void>;
@@ -1614,6 +1618,7 @@ export const imclawPlugin = {
         mediaDir,
         configConnectKey,
         ownerTinodeUid: null,
+        lastSyncedAgentName: null,
         stopped: false,
         authPaused: false,
         cleanup,
@@ -1721,6 +1726,7 @@ export const imclawPlugin = {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(profilePatch),
           });
+          if (agentNameToSync) ctx.lastSyncedAgentName = agentNameToSync;
           log?.info?.(
             `[imclaw] profile synced${agentNameToSync ? ` (name: ${agentNameToSync})` : ''}${pluginVersion ? ` (version: ${pluginVersion})` : ''}`,
           );
@@ -1932,6 +1938,28 @@ export const imclawPlugin = {
             }
           } catch { /* silent */ }
         }
+
+        // Detect agent_name changes in config (push-on-change so the heartbeat
+        // payload stays empty in steady state).
+        try {
+          const rt = getPluginRuntime();
+          if (rt) {
+            const currentCfg = (rt.config as any).current?.() ?? rt.config.loadConfig() as Record<string, any>;
+            const currentAccount = currentCfg?.channels?.imclaw?.accounts?.[accountId];
+            const liveAgentName = (currentAccount?.agentName as string) || null;
+            if (liveAgentName && liveAgentName !== ctx.lastSyncedAgentName) {
+              const res = await apiFetch('/agent/profile', {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ name: liveAgentName }),
+              });
+              if (res?.ok) {
+                ctx.lastSyncedAgentName = liveAgentName;
+                log?.info?.(`[imclaw] agent name synced → ${liveAgentName}`);
+              }
+            }
+          }
+        } catch { /* silent — retry next tick */ }
       };
       sendHeartbeat(); // immediate first beat
       ctx.heartbeatTimer = setInterval(sendHeartbeat, 60_000); // every 60s (TTL is 120s)
@@ -2538,23 +2566,40 @@ export const imclawPlugin = {
               results.push({ input, resolved: false, note: 'no matching group' });
             }
           } else {
-            // Match contact by agent_name, alias, claw_name, display_name, or claw_id
-            const match = entries.find((c: any) => {
+            // Match contact by claw_alias, agent_name, alias, claw_name,
+            // display_name, custom_id, or claw_id. Collect ALL exact matches
+            // — if one name token maps to multiple contacts we must not
+            // silently route to the first one, otherwise mentions land on
+            // the wrong peer.
+            const matches = entries.filter((c: any) => {
               const fields = [
+                c.claw_alias,
                 c.contact_agent_name,
                 c.alias,
                 c.contact_claw_name,
                 c.contact_display_name,
+                c.contact_custom_id,
                 c.contact_claw_id,
               ];
-              return fields.some(f => f && f.toLowerCase() === normalized);
+              return fields.some(f => f && String(f).toLowerCase() === normalized);
             });
-            if (match && match.contact_tinode_uid) {
+            if (matches.length === 1 && matches[0].contact_tinode_uid) {
+              const match = matches[0];
               results.push({
                 input,
                 resolved: true,
                 id: match.contact_tinode_uid,
-                name: match.contact_agent_name || match.alias || match.contact_claw_name,
+                name: match.claw_alias || match.contact_agent_name || match.alias || match.contact_claw_name,
+              });
+            } else if (matches.length > 1) {
+              const ids = matches
+                .map((c: any) => c.contact_claw_id || c.contact_tinode_uid)
+                .filter(Boolean)
+                .join(', ');
+              results.push({
+                input,
+                resolved: false,
+                note: `ambiguous: matched ${matches.length} contacts (${ids}) — specify a CLAW-ID, @customId or UID`,
               });
             } else if (ownerInfo?.tinode_uid && ownerInfo.display_name
                        && ownerInfo.display_name.toLowerCase() === normalized) {

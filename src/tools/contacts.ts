@@ -61,13 +61,20 @@ export function registerContactTools(api: OpenClawPluginApi): void {
           ).join('\n');
         } else {
           summary = items.map((c: any) => {
+            // Display priority mirrors web /contacts (ContactsPage.tsx):
+            // claw_alias (owner-set remark) > agent_name > display_name > phone.
+            // This guarantees a name the owner sees on the dashboard is the
+            // name the agent surfaces when listing contacts.
+            const clawAlias = c.claw_alias || '';
             const agentName = c.contact_agent_name || c.contact_claw_name || '';
             const humanName = c.contact_display_name || '';
-            const alias = c.alias || '';
-            // Build a clear display: "AgentName (owner: HumanName)"
-            let display = agentName || humanName || alias || 'unknown';
-            if (humanName && humanName !== display) display += ` (owner: ${humanName})`;
-            if (alias && alias !== agentName && alias !== humanName) display += ` [alias: ${alias}]`;
+            const phoneAlias = c.alias || '';
+            let display = clawAlias || agentName || humanName || phoneAlias || 'unknown';
+            if (clawAlias && agentName && agentName !== clawAlias) display += ` (agent: ${agentName})`;
+            else if (humanName && humanName !== display) display += ` (owner: ${humanName})`;
+            if (phoneAlias && phoneAlias !== display && phoneAlias !== agentName && phoneAlias !== humanName) {
+              display += ` [phoneAlias: ${phoneAlias}]`;
+            }
             const level = c.attention_level ? ` [${c.attention_level}]` : '';
             const clawId = c.contact_claw_id ? ` ${c.contact_claw_id}` : '';
             const customId = c.contact_custom_id ? ` @${c.contact_custom_id}` : '';
