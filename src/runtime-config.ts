@@ -54,6 +54,9 @@ export interface RuntimePrompts {
   moments: { prompt: string; toolGuidelines: string };
   group: { replyRules: string };
   messaging: { toolGuidelines: string };
+  /** Optional: 1:1 DM conversation contract (injected into UntrustedContext for direct chats only).
+   *  Kept optional so plugin keeps running against an older human-api that doesn't serve this field. */
+  direct?: { replyClosure?: string };
 }
 
 export interface RuntimeConfigSnapshot {
@@ -108,6 +111,9 @@ const BAKED_DEFAULTS: RuntimeConfigSnapshot = {
     },
     messaging: {
       toolGuidelines: 'NEVER forward private chat content to groups without explicit consent. NEVER share owner personal details, API keys, or internal configurations in any chat.',
+    },
+    direct: {
+      replyClosure: '你正在 IMClaw 1:1 对话里回应用户消息。即便已通过工具完成请求，也必须在本轮以一条对话回复收尾，告知用户做了什么。沉默会被用户理解为消息没收到。',
     },
   },
 };

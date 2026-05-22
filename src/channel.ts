@@ -392,17 +392,23 @@ function isRecoverableSessionContextError(text: string): boolean {
 const SESSION_KEY_TTL = 30 * 60 * 1000; // 30 minutes
 const corruptedSessionKeys = new Map<string, { suffix: string; expiry: number }>();
 
-const SESSION_BOUNDARY_STATE_DIR = path.join(os.homedir(), '.openclaw', 'imclaw');
-const SESSION_BOUNDARY_STATE_PATH = path.join(SESSION_BOUNDARY_STATE_DIR, 'session-boundaries.json');
-const DEFAULT_SESSION_ROTATE_TOPIC_MESSAGES = 80;
-const MAX_SESSION_BOUNDARIES = 1000;
-
-type SessionBoundaryState = Record<string, { seqId: number; updatedAt: number }>;
-let sessionBoundariesLoaded = false;
-let sessionBoundariesDirty = false;
-let sessionBoundariesFlushTimer: NodeJS.Timeout | null = null;
-const manualSessionBoundaries = new Map<string, { seqId: number; updatedAt: number }>();
-
+// Session ownership note (post runtime-takeover):
+//
+//   IMClaw channel layer NO LONGER segments sessions by message count. Each peer
+//   relationship maps to exactly one sessionKey for its entire lifetime, aligned with
+//   how telegram/discord/whatsapp/slack work. The OpenClaw runtime is responsible for
+//   context length management (compaction / memoryFlush / context-engine assembly).
+//
+//   The only sessionKey rotation that remains is the thinkingError safety net:
+//   `corruptedSessionKeys` adds a short-lived `:rs-<ts>` suffix when the SDK reports
+//   a recoverable session-context error (see channel.ts retry block). That mechanism
+//   is orthogonal to the removed seg-N: it does not segment by traffic; it only
+//   sidesteps a known-bad transcript file with a 30-minute TTL.
+//
+//   Manual "new session" requests from the web dashboard now travel as plain "/new"
+//   text messages — the OpenClaw SDK's built-in DEFAULT_RESET_TRIGGERS (["/new",
+//   "/reset"]) detects them and resets the session for the SAME sessionKey. We no
+//   longer track manual boundaries client-side.
 function getCorruptedSuffix(baseKey: string): string | undefined {
   const entry = corruptedSessionKeys.get(baseKey);
   if (!entry) return undefined;
@@ -417,115 +423,79 @@ function setCorruptedSuffix(baseKey: string, suffix: string): void {
   corruptedSessionKeys.set(baseKey, { suffix, expiry: Date.now() + SESSION_KEY_TTL });
 }
 
-function loadSessionBoundaries(): void {
-  if (sessionBoundariesLoaded) return;
-  sessionBoundariesLoaded = true;
+// Tracks which accounts have already logged compaction-config warnings, so we
+// don't spam the log every account restart.
+const compactionWarningsLogged = new Set<string>();
+
+/**
+ * Validate the OpenClaw runtime's compaction configuration against IMClaw's
+ * post-takeover assumptions and warn (do not fail) if it looks misconfigured.
+ *
+ * Background: before the runtime-takeover refactor, channel.ts capped session
+ * length by appending :seg-N suffixes every N inbound messages. Now we trust
+ * `cfg.agents.defaults.compaction` (+ `memoryFlush`) to keep transcripts bounded.
+ * If that subtree is missing / disabled / mis-tuned, long IMClaw conversations
+ * could hit "context length exceeded" — surface the risk loud and early.
+ *
+ * Never throws; safe to call from startAccount. Logs at most once per account
+ * for the lifetime of the process.
+ */
+function checkRuntimeCompactionConfig(
+  cfg: Record<string, any>,
+  accountId: string,
+  log?: { info?: (msg: string) => void; warn?: (msg: string) => void; error?: (msg: string) => void },
+): void {
+  if (compactionWarningsLogged.has(accountId)) return;
+  compactionWarningsLogged.add(accountId);
+
   try {
-    if (!fs.existsSync(SESSION_BOUNDARY_STATE_PATH)) return;
-    const parsed = JSON.parse(fs.readFileSync(SESSION_BOUNDARY_STATE_PATH, 'utf-8')) as SessionBoundaryState;
-    if (!parsed || typeof parsed !== 'object') return;
-    for (const [key, value] of Object.entries(parsed)) {
-      if (
-        value &&
-        Number.isFinite(value.seqId) &&
-        value.seqId > 0 &&
-        Number.isFinite(value.updatedAt)
-      ) {
-        manualSessionBoundaries.set(key, { seqId: value.seqId, updatedAt: value.updatedAt });
+    const defaults = cfg?.agents?.defaults ?? {};
+    const compaction = defaults.compaction ?? {};
+    const memoryFlush = compaction.memoryFlush ?? {};
+    const issues: string[] = [];
+
+    // memoryFlush is the pre-compaction safety net. Explicit false is the only
+    // unambiguous misconfig — undefined means "SDK default (enabled)".
+    if (memoryFlush.enabled === false) {
+      issues.push('agents.defaults.compaction.memoryFlush.enabled=false — runtime will not flush before context overflow');
+    }
+
+    // softThresholdTokens default is 4000 (distance to compaction). Anything
+    // very small (<500) effectively disables the early warning; very large
+    // (>50000) means flush never triggers before the model's hard limit.
+    if (typeof memoryFlush.softThresholdTokens === 'number') {
+      if (memoryFlush.softThresholdTokens < 500) {
+        issues.push(`agents.defaults.compaction.memoryFlush.softThresholdTokens=${memoryFlush.softThresholdTokens} is unusually low (<500); memory flush may never effectively trigger`);
+      } else if (memoryFlush.softThresholdTokens > 50_000) {
+        issues.push(`agents.defaults.compaction.memoryFlush.softThresholdTokens=${memoryFlush.softThresholdTokens} is unusually high (>50000); memory flush may trigger too close to the model hard limit`);
       }
     }
-  } catch { /* best-effort local state */ }
-}
 
-function scheduleSessionBoundariesFlush(): void {
-  if (sessionBoundariesFlushTimer) return;
-  sessionBoundariesFlushTimer = setTimeout(() => {
-    sessionBoundariesFlushTimer = null;
-    flushSessionBoundaries();
-  }, 5_000);
-}
-
-function flushSessionBoundaries(): void {
-  if (!sessionBoundariesDirty) return;
-  try {
-    fs.mkdirSync(SESSION_BOUNDARY_STATE_DIR, { recursive: true });
-    const entries = [...manualSessionBoundaries.entries()]
-      .sort((a, b) => b[1].updatedAt - a[1].updatedAt)
-      .slice(0, MAX_SESSION_BOUNDARIES);
-    manualSessionBoundaries.clear();
-    const state: SessionBoundaryState = {};
-    for (const [key, value] of entries) {
-      manualSessionBoundaries.set(key, value);
-      state[key] = value;
+    // maxHistoryShare default is 0.5. Outside [0.1, 0.9] suggests a typo.
+    if (typeof compaction.maxHistoryShare === 'number') {
+      if (compaction.maxHistoryShare < 0.1 || compaction.maxHistoryShare > 0.9) {
+        issues.push(`agents.defaults.compaction.maxHistoryShare=${compaction.maxHistoryShare} is outside the expected [0.1, 0.9] range`);
+      }
     }
-    fs.writeFileSync(SESSION_BOUNDARY_STATE_PATH, JSON.stringify(state), { mode: 0o600 });
-    sessionBoundariesDirty = false;
-  } catch { /* best-effort local state */ }
-}
 
-function makeSessionBoundaryKey(accountId: string, topic: string): string {
-  return `${accountId}:${topic}`;
-}
+    // contextTokens is the model context window cap (used for util calculations).
+    // Missing it is fine (runtime infers from model id), but log so operators know.
+    if (defaults.contextTokens !== undefined && typeof defaults.contextTokens !== 'number') {
+      issues.push(`agents.defaults.contextTokens is set but not a number: ${JSON.stringify(defaults.contextTokens)}`);
+    }
 
-function rememberManualSessionBoundary(accountId: string, topic: string, seqId: number): void {
-  loadSessionBoundaries();
-  const key = makeSessionBoundaryKey(accountId, topic);
-  const current = manualSessionBoundaries.get(key);
-  if (current && current.seqId >= seqId) return;
-  manualSessionBoundaries.set(key, { seqId, updatedAt: Date.now() });
-  sessionBoundariesDirty = true;
-  scheduleSessionBoundariesFlush();
-}
+    if (issues.length === 0) {
+      log?.info?.(`[imclaw] compaction config OK for account=${accountId} (memoryFlush.enabled=${memoryFlush.enabled ?? 'default'}, softThresholdTokens=${memoryFlush.softThresholdTokens ?? 'default'}, maxHistoryShare=${compaction.maxHistoryShare ?? 'default'})`);
+      return;
+    }
 
-function getManualSessionBoundary(accountId: string, topic: string): { seqId: number; updatedAt: number } | undefined {
-  loadSessionBoundaries();
-  return manualSessionBoundaries.get(makeSessionBoundaryKey(accountId, topic));
-}
-
-function resolveSessionRotateTopicMessages(): number {
-  const raw = Number(pluginLevelConfig.sessionRotateTopicMessages ?? pluginLevelConfig.sessionRotateMessages);
-  if (raw === 0) return 0;
-  if (!Number.isFinite(raw) || raw < 0) return DEFAULT_SESSION_ROTATE_TOPIC_MESSAGES;
-  return Math.max(20, Math.min(1000, Math.floor(raw)));
-}
-
-function isManualSessionBoundaryControl(content: any): boolean {
-  return !!content &&
-    typeof content === 'object' &&
-    content.tp === 'control' &&
-    content.scope === 'imclaw' &&
-    content.event === 'agent_chat_new_session';
-}
-
-function resolveBoundedSessionKey(params: {
-  baseSessionKey: string;
-  accountId: string;
-  topic: string;
-  seqId: number;
-}): { sessionKeyBase: string; rolloverNotice?: string } {
-  const limit = resolveSessionRotateTopicMessages();
-  const boundary = getManualSessionBoundary(params.accountId, params.topic);
-  const parts: string[] = [];
-  let baseSeq = 0;
-
-  if (boundary && params.seqId > boundary.seqId) {
-    parts.push(`manual-${boundary.seqId}`);
-    baseSeq = boundary.seqId;
+    log?.warn?.(`[imclaw] runtime compaction config concerns for account=${accountId} (IMClaw channel no longer caps session length, so this could let context grow unbounded):`);
+    for (const issue of issues) log?.warn?.(`[imclaw]   - ${issue}`);
+    log?.warn?.(`[imclaw] reference: see openclaw plugin-sdk config/types.agent-defaults.d.ts § AgentCompactionConfig.`);
+  } catch (err: any) {
+    // Self-check failure must never block account startup.
+    log?.warn?.(`[imclaw] compaction config self-check failed (non-fatal): ${err?.message ?? err}`);
   }
-
-  if (limit > 0) {
-    const relativeSeq = Math.max(0, params.seqId - baseSeq - 1);
-    const segment = Math.floor(relativeSeq / limit);
-    if (segment > 0 || parts.length > 0) parts.push(`seg-${segment}`);
-  }
-
-  if (parts.length === 0) return { sessionKeyBase: params.baseSessionKey };
-
-  const sessionKeyBase = `${params.baseSessionKey}:${parts.join('-')}`;
-  const rolloverNotice = boundary && params.seqId > boundary.seqId
-    ? `IMClaw runtime note: the human started a new IMClaw chat session at topic seq ${boundary.seqId}; earlier messages remain in IMClaw history but are not loaded in this runtime context.`
-    : `IMClaw runtime note: this long IMClaw conversation was automatically continued in a fresh runtime context segment. Earlier messages remain in IMClaw history but are not loaded in this runtime context.`;
-  return { sessionKeyBase, rolloverNotice };
 }
 
 // ─── Spam repetition detection ───
@@ -716,15 +686,34 @@ function registerMessageHandler(
       : JSON.stringify(msg.content).substring(0, 100);
     log?.info?.(`[imclaw-channel] onMessage: topic=${msg.topic} from=${msg.from} seq=${msg.seqId} isGroup=${msg.isGroup} content=${contentPreview}`);
 
-    if (isManualSessionBoundaryControl(msg.content)) {
+    // Legacy compat: older human-api builds send a `{tp:'control', scope:'imclaw',
+    // event:'agent_chat_new_session'}` message to request a session reset. Newer
+    // builds send "/new" plain text directly (caught by SDK reset triggers below).
+    // For migration safety, translate any legacy control message into the new
+    // "/new" text so the rest of the dispatch pipeline (and the SDK reset trigger)
+    // handles it uniformly.
+    //
+    // Authorization: require an explicit owner UID match for DMs. If the account
+    // has no owner UID known (e.g. during early bootstrap before identity sync
+    // completes), reject — fail closed so a stranger can't forge a control
+    // message into a session reset.
+    if (
+      msg.content &&
+      typeof msg.content === 'object' &&
+      (msg.content as any).tp === 'control' &&
+      (msg.content as any).scope === 'imclaw' &&
+      (msg.content as any).event === 'agent_chat_new_session'
+    ) {
       const ownerUidForControl = accounts.get(accountId)?.ownerTinodeUid;
-      if (!msg.isGroup && (!ownerUidForControl || ownerUidForControl === msg.from)) {
-        rememberManualSessionBoundary(accountId, msg.topic, msg.seqId);
-        log?.info?.(`[imclaw-channel] recorded manual session boundary: topic=${msg.topic} seq=${msg.seqId}`);
-      } else {
-        log?.warn?.(`[imclaw-channel] ignored unauthorized session boundary control: topic=${msg.topic} from=${msg.from}`);
+      if (msg.isGroup || !ownerUidForControl || ownerUidForControl !== msg.from) {
+        log?.warn?.(`[imclaw-channel] ignored unauthorized session boundary control: topic=${msg.topic} from=${msg.from} isGroup=${msg.isGroup} ownerKnown=${!!ownerUidForControl}`);
+        return;
       }
-      return;
+      log?.info?.(`[imclaw-channel] legacy session-boundary control received on ${msg.topic}; translating to "/new" reset trigger`);
+      // Rewrite content so downstream sees a normal text message; SDK reset trigger
+      // (DEFAULT_RESET_TRIGGERS = ["/new", "/reset"]) will reset the session in
+      // place, using the same sessionKey.
+      (msg as any).content = '/new';
     }
 
     let text: string | undefined;
@@ -866,18 +855,10 @@ function registerMessageHandler(
       `[imclaw-channel] classified sender=${senderKind} conversation=${conversationKind} peer=${peerId} name=${senderName}`,
     );
 
-    const boundedSession = resolveBoundedSessionKey({
-      baseSessionKey,
-      accountId: routeAccountId,
-      topic: msg.topic,
-      seqId: msg.seqId,
-    });
-    const activeBaseSessionKey = boundedSession.sessionKeyBase;
-    if (activeBaseSessionKey !== baseSessionKey) {
-      log?.info?.(`[imclaw-channel] using bounded session key: ${activeBaseSessionKey}`);
-    }
-
-    // If this session was previously corrupted (within TTL), use the rotated suffix
+    // Post runtime-takeover: sessionKey is used as-is. Runtime owns context length
+    // management via compaction / memoryFlush / context-engine assembly. Only the
+    // corrupted-session safety net can still append a transient `:rs-<ts>` suffix.
+    const activeBaseSessionKey = baseSessionKey;
     const existingSuffix = getCorruptedSuffix(activeBaseSessionKey);
 
     // Natural-language approval shortcuts:
@@ -915,7 +896,10 @@ function registerMessageHandler(
       thinkingErrorDetected = false;
 
       const untrustedContext: string[] = [];
-      if (boundedSession.rolloverNotice) untrustedContext.push(boundedSession.rolloverNotice);
+      // (rolloverNotice removed in runtime-takeover refactor — runtime compaction
+      // continues the conversation naturally, no "we lost the older messages" hint
+      // is needed or accurate anymore.)
+
       // Refresh runtime config before reading the snapshot. Plaza/moments loops
       // default to off, so without this the group reply rules / staleMentionMs /
       // maxChunkSize would stay pinned to the connect-time best-effort fetch for
@@ -943,6 +927,14 @@ function registerMessageHandler(
             `MentionsMe=true but this message is ${ageMin} min old (likely history replay on subscribe). Reply only if the request is still actionable now; otherwise stay silent.`,
           );
         }
+      } else {
+        // 1:1 DM conversation contract — closes the "silent tool turn" loophole.
+        // Optional-chained so an older human-api without the `direct` field degrades
+        // gracefully to the pre-change behavior (no injection).
+        // Intentionally NOT injected in group chat: group's mention/summary/stale rules
+        // already encode "silence is sometimes correct"; forcing a reply would override them.
+        const replyClosure = rcSnapshot.prompts.direct?.replyClosure;
+        if (replyClosure) untrustedContext.push(replyClosure);
       }
 
       const rawCtx = {
@@ -1100,37 +1092,64 @@ function registerMessageHandler(
       : activeBaseSessionKey;
 
     const DISPATCH_TIMEOUT_MS = 120_000; // 2 minutes
-    try {
-      log?.info?.(`[imclaw-channel] dispatching to runtime: text="${(text || '').substring(0, 80)}" mediaUrl=${mediaUrl || 'none'}`);
-      await Promise.race([
-        doDispatch(initialSessionKey),
-        new Promise<never>((_, reject) =>
-          setTimeout(() => reject(new Error(`dispatch timed out after ${DISPATCH_TIMEOUT_MS}ms`)), DISPATCH_TIMEOUT_MS),
-        ),
-      ]);
-    } catch (err: any) {
-      // Detect thinking block error from thrown exception
-      if (isRecoverableSessionContextError(err.message || '')) {
-        thinkingErrorDetected = true;
-        log?.warn?.(`[imclaw-channel] recoverable session context error detected in exception: ${err.message}`);
-      } else {
-        log?.error?.(`[imclaw-channel] dispatch error: ${err.message}\n${err.stack}`);
-      }
-    }
 
-    if (thinkingErrorDetected) {
-      // Rotate session key with TTL so future messages skip the broken session temporarily
-      const newSuffix = `rs-${Date.now()}`;
-      setCorruptedSuffix(activeBaseSessionKey, newSuffix);
-      const newSessionKey = `${activeBaseSessionKey}:${newSuffix}`;
-      log?.info?.(`[imclaw-channel] session corrupted, rotating key: ${initialSessionKey} → ${newSessionKey}`);
+    // ── Protocol-level lifecycle wrapper (Tinode {note}) ──
+    //
+    // recv: signals "we received your inbound seq" immediately on dispatch entry.
+    // kp:   typing indicator; fire immediately for instant feedback, then every ~3s
+    //       to keep the receiver's "typing..." UI alive (Tinode kp window is ~5-10s).
+    // read: signals "we are done with your inbound seq", emitted in the OUTER finally
+    //       so it fires even on:
+    //         - silent tool turn (deliver never called)
+    //         - dispatch timeout
+    //         - recoverable session-context retry (we want read AFTER the retry, not before)
+    //         - any thrown error
+    //
+    // Known limitation (R1): the SDK's dispatch path does not expose an abort signal.
+    // If Promise.race times out, doDispatch may still be running in the background and
+    // a late deliver could fire after our `read`. Acknowledged; orthogonal to this change.
+    let kpTimer: NodeJS.Timeout | null = null;
+    try {
+      bridge.sendNote(msg.topic, 'recv', msg.seqId);
+      bridge.sendNote(msg.topic, 'kp');
+      kpTimer = setInterval(() => bridge.sendNote(msg.topic, 'kp'), 3_000);
+
+      log?.info?.(`[imclaw-channel] dispatching to runtime: text="${(text || '').substring(0, 80)}" mediaUrl=${mediaUrl || 'none'}`);
 
       try {
-        await bridge.sendMessage(msg.topic, '⚠️ 检测到会话上下文异常，正在使用新会话重试...');
-        await doDispatch(newSessionKey);
-      } catch (retryErr: any) {
-        log?.error?.(`[imclaw-channel] retry dispatch error: ${retryErr.message}\n${retryErr.stack}`);
+        await Promise.race([
+          doDispatch(initialSessionKey),
+          new Promise<never>((_, reject) =>
+            setTimeout(() => reject(new Error(`dispatch timed out after ${DISPATCH_TIMEOUT_MS}ms`)), DISPATCH_TIMEOUT_MS),
+          ),
+        ]);
+      } catch (err: any) {
+        // Detect thinking block error from thrown exception
+        if (isRecoverableSessionContextError(err.message || '')) {
+          thinkingErrorDetected = true;
+          log?.warn?.(`[imclaw-channel] recoverable session context error detected in exception: ${err.message}`);
+        } else {
+          log?.error?.(`[imclaw-channel] dispatch error: ${err.message}\n${err.stack}`);
+        }
       }
+
+      if (thinkingErrorDetected) {
+        // Rotate session key with TTL so future messages skip the broken session temporarily
+        const newSuffix = `rs-${Date.now()}`;
+        setCorruptedSuffix(activeBaseSessionKey, newSuffix);
+        const newSessionKey = `${activeBaseSessionKey}:${newSuffix}`;
+        log?.info?.(`[imclaw-channel] session corrupted, rotating key: ${initialSessionKey} → ${newSessionKey}`);
+
+        try {
+          await bridge.sendMessage(msg.topic, '⚠️ 检测到会话上下文异常，正在使用新会话重试...');
+          await doDispatch(newSessionKey);
+        } catch (retryErr: any) {
+          log?.error?.(`[imclaw-channel] retry dispatch error: ${retryErr.message}\n${retryErr.stack}`);
+        }
+      }
+    } finally {
+      if (kpTimer) { clearInterval(kpTimer); kpTimer = null; }
+      try { bridge.sendNote(msg.topic, 'read', msg.seqId); } catch { /* best-effort */ }
     }
   });
 }
@@ -1334,6 +1353,11 @@ export const imclawPlugin = {
     }): Promise<void> {
       const { cfg, accountId, account, abortSignal, log } = params;
       const pc = resolvePluginConfig(cfg);
+
+      // Post runtime-takeover: IMClaw channel no longer caps session length itself,
+      // so we rely on the runtime's compaction / memoryFlush. Warn at boot if the
+      // OpenClaw config looks like it would let context grow unbounded.
+      checkRuntimeCompactionConfig(cfg, accountId, log);
 
       // Clean up any previous account instance (e.g. gateway restart on config change)
       const prev = accounts.get(accountId);

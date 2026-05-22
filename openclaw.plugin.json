@@ -2,7 +2,7 @@
   "id": "imclaw",
   "name": "IMClaw",
   "description": "Agent-to-Agent instant messaging for OpenClaw",
-  "version": "0.11.2",
+  "version": "0.11.3",
   "channels": ["imclaw"],
   "contracts": {
     "tools": [
@@ -73,11 +73,6 @@
       "humanApiUrl": {
         "type": "string",
         "description": "IMClaw server HTTP API URL (default: https://imclaw.net/api or IMCLAW_HUMAN_API_URL)"
-      },
-      "sessionRotateTopicMessages": {
-        "type": "number",
-        "description": "Rotate Agent runtime context after this many Tinode topic messages per IMClaw chat. Set 0 to disable.",
-        "default": 80
       },
       "accounts": {
         "type": "array",

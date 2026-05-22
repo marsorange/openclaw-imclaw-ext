@@ -31,6 +31,12 @@ export class TinodeClient extends EventEmitter {
   private topicLimits = new Map<string, number>();
   /** Tracks last processed seqid per topic for incremental history fetching */
   private topicSinceSeqIds = new Map<string, number>();
+  /** Records the limit used for the current catch-up subscribe per topic, so the
+   *  message-receipt path can warn when we hit the cap (a sign of potential
+   *  message loss after a long offline window). Cleared after the first message
+   *  arrives or after a short timeout. */
+  private catchupLimitHits = new Map<string, number>();
+  private catchupReceivedCounts = new Map<string, number>();
   /** Maps requested topic name → resolved topic name (e.g. "usrXXXX" → "p2pXXXXYYYY") */
   private resolvedTopics = new Map<string, string>();
   /** Maps peer UID → display name (from {meta} sub public.fn) */
@@ -74,6 +80,22 @@ export class TinodeClient extends EventEmitter {
    */
   setTopicSinceSeqId(topic: string, seqId: number): void {
     this.topicSinceSeqIds.set(topic, seqId);
+  }
+
+  /**
+   * Send a Tinode {note} packet (out-of-band protocol-level feedback).
+   * - what="recv": inbound seq received (delivery receipt)
+   * - what="read": inbound seq read (read receipt; advances per-user read marker)
+   * - what="kp":   "keypress" / typing indicator (no seq; visible for ~5-10s on receivers)
+   *
+   * Best-effort: silently drops when ws is not open. Tinode treats {note} as fire-and-forget;
+   * no response is expected.
+   */
+  sendNote(topic: string, what: 'recv' | 'read' | 'kp', seq?: number): void {
+    if (this.ws?.readyState !== globalThis.WebSocket.OPEN) return;
+    const note: { what: string; topic: string; seq?: number } = { what, topic };
+    if (seq !== undefined) note.seq = seq;
+    this.send({ note });
   }
 
   async connect(): Promise<void> {
@@ -261,10 +283,43 @@ export class TinodeClient extends EventEmitter {
       }, 10000);
 
       this.ws?.addEventListener('message', handler);
-      const dataLimit = this.topicLimits.get(topicName) || 100;
+      // Two distinct cases drive the data fetch size:
+      //
+      // (A) Cold subscribe — no `sinceSeqId` recorded (brand-new topic, or no
+      //     dedup state on disk on first-ever boot). Server has no cap and would
+      //     blast up to the full topic history. We deliberately cap this LOW so
+      //     a fresh account with many topics doesn't fan-out into thousands of
+      //     LLM dispatches on first boot. 20 messages gives the agent recent
+      //     context without saturating.
+      //
+      // (B) Catch-up subscribe — `sinceSeqId` is set (steady-state restart with
+      //     persisted dedup). Server filters by since, so the response only
+      //     contains messages the agent has NOT yet processed. We MUST NOT cap
+      //     this aggressively: dropping returned messages here while bridge.ts
+      //     advances dedup to the highest seq it sees would permanently skip
+      //     anything beyond the cap. Use a generous catch-up limit instead, and
+      //     log loudly if we hit it (signal that a longer offline window may
+      //     have lost messages and warrants ops attention).
+      //
+      // Per-topic overrides via setTopicLimit() still take precedence (e.g.
+      // group sync sets specific limits after bridge.start()).
+      const COLD_SUBSCRIBE_LIMIT = 20;
+      const CATCHUP_SUBSCRIBE_LIMIT = 500;
+      const explicitLimit = this.topicLimits.get(topicName);
       const sinceSeqId = this.topicSinceSeqIds.get(topicName);
+      const isCatchup = sinceSeqId !== undefined && sinceSeqId > 0;
+      const dataLimit = explicitLimit !== undefined
+        ? explicitLimit
+        : (isCatchup ? CATCHUP_SUBSCRIBE_LIMIT : COLD_SUBSCRIBE_LIMIT);
       const dataQuery: { limit: number; since?: number } = { limit: dataLimit };
       if (sinceSeqId) dataQuery.since = sinceSeqId;
+
+      // Track for the eventual {ctrl} handler so it can warn if catch-up was
+      // capped (and thus may have dropped messages between sinceSeqId and the
+      // server's true latest seq).
+      if (isCatchup && explicitLimit === undefined) {
+        this.catchupLimitHits.set(topicName, dataLimit);
+      }
       this.send({
         sub: {
           id,
@@ -342,6 +397,23 @@ export class TinodeClient extends EventEmitter {
       // Track user → p2p topic mapping from incoming messages
       if (msg.data.topic?.startsWith('p2p') && msg.data.from) {
         this.resolvedTopics.set(msg.data.from, msg.data.topic);
+      }
+
+      // Count messages per topic during the catch-up window so we can warn
+      // when the response saturated the limit (likely message loss).
+      const expectedLimit = this.catchupLimitHits.get(msg.data.topic);
+      if (expectedLimit !== undefined) {
+        const cur = (this.catchupReceivedCounts.get(msg.data.topic) ?? 0) + 1;
+        this.catchupReceivedCounts.set(msg.data.topic, cur);
+        if (cur === expectedLimit) {
+          console.warn(
+            `[tinode] catch-up subscribe on ${msg.data.topic} returned the full limit (${expectedLimit} messages); ` +
+            `messages older than seq=${msg.data.seq} but past the offline window may have been skipped. ` +
+            `Consider increasing CATCHUP_SUBSCRIBE_LIMIT or implementing paginated catch-up.`,
+          );
+          // One warning is enough; clear so we don't log again for this window.
+          this.catchupLimitHits.delete(msg.data.topic);
+        }
       }
 
       const tinodeMsg: TinodeMessage = {

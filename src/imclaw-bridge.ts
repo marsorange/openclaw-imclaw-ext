@@ -65,24 +65,38 @@ class MessageDedup {
   }
 
   private load(): void {
+    if (!fs.existsSync(DEDUP_STATE_PATH)) {
+      // First-ever startup (or state file wiped). Tinode subscribe will replay up to
+      // the per-topic data limit (~100 messages) once; subsequent restarts are bounded
+      // by the persisted since-seq. Visible here so operators can correlate boot logs
+      // with bursts of dispatch traffic.
+      console.info(`[imclaw-bridge] dedup state not found at ${DEDUP_STATE_PATH}; starting fresh (first boot or state wiped)`);
+      return;
+    }
     try {
-      if (fs.existsSync(DEDUP_STATE_PATH)) {
-        const data = JSON.parse(fs.readFileSync(DEDUP_STATE_PATH, 'utf-8'));
-        if (data && typeof data === 'object') {
-          for (const [key, val] of Object.entries(data)) {
-            if (typeof val === 'number') this.seqs.set(key, val);
-          }
+      const data = JSON.parse(fs.readFileSync(DEDUP_STATE_PATH, 'utf-8'));
+      if (data && typeof data === 'object') {
+        for (const [key, val] of Object.entries(data)) {
+          if (typeof val === 'number') this.seqs.set(key, val);
         }
       }
-    } catch { /* ignore — start fresh */ }
+    } catch (err: any) {
+      // Falling back to empty state means the next subscribe will replay up to the
+      // per-topic data limit. Surface this so operators can recover the file from
+      // backup or accept the one-time replay.
+      console.warn(`[imclaw-bridge] dedup state load failed at ${DEDUP_STATE_PATH}; falling back to empty state. ` +
+        `Next subscribe may replay recent history. Error: ${err?.message ?? err}`);
+    }
   }
 
   private scheduleFlush(): void {
     if (this.flushTimer) return;
+    // 200ms debounce: small enough to bound loss-on-crash to ~a handful of seqs,
+    // large enough to coalesce typical message bursts (group chat replies, etc).
     this.flushTimer = setTimeout(() => {
       this.flushTimer = null;
       this.flush();
-    }, 2_000);
+    }, 200);
   }
 
   flush(): void {
@@ -191,12 +205,15 @@ export class ImclawBridge {
 
       // 5. No time-based filter — rely on seqid dedup (step 2/4) instead.
       //    This ensures offline messages are processed when the agent comes online.
-      //    Within a session, dedup prevents re-processing already-handled messages.
-      //    On reconnection, the in-memory dedup retains state so only genuinely new
-      //    messages are dispatched. On full restart, all recent history is replayed
-      //    (bounded by the subscription data limit, typically 100 messages).
-      //    The since-seqid is synced to TinodeClient so reconnection uses incremental
-      //    fetch instead of re-fetching the full limit.
+      //    Restart behavior:
+      //    - Persisted dedup state at ~/.openclaw/imclaw/dedup-state.json is loaded
+      //      in MessageDedup.load() before start().
+      //    - start() pushes the saved per-topic seq into TinodeClient.setTopicSinceSeqId
+      //      BEFORE calling connect(), so the very first {sub} carries `since:<lastSeq>`
+      //      and the Tinode server only returns seq > lastSeq messages.
+      //    - The "first-ever boot replays ~100 messages" case only applies when the
+      //      state file is missing (logged as info in MessageDedup.load).
+      //    - The 200ms flush debounce bounds loss-on-crash to a handful of seqs.
 
       const mentions = extractMentions(msg.content, msg.head);
       const selfUid = this.client.getSelfUid();
@@ -262,13 +279,28 @@ export class ImclawBridge {
   }
 
   async start(): Promise<void> {
-    // Restore persisted seq IDs so Tinode skips already-processed messages on subscribe
+    // Restore persisted seq IDs so Tinode skips already-processed messages on subscribe.
+    // Topics WITH a saved seq → catch-up subscribe (fetches only seq > saved).
+    // Topics WITHOUT a saved seq → cold subscribe (capped at COLD_SUBSCRIBE_LIMIT
+    // in TinodeClient to bound the first-boot blast radius).
     const savedSeqs = this.dedup.getAllSeqs(this.config.clawId);
     for (const [topic, seqId] of savedSeqs) {
       this.client.setTopicSinceSeqId(topic, seqId);
     }
     if (savedSeqs.size > 0) {
       console.log(`[imclaw-bridge] restored ${savedSeqs.size} topic seq IDs from disk`);
+    } else {
+      // First-ever boot for this clawId on this host. The agent will auto-subscribe
+      // to every topic in its `me` list, each pulling up to COLD_SUBSCRIBE_LIMIT
+      // messages of history. With many topics this can fan out to a non-trivial
+      // number of LLM dispatches in the first few minutes. Log explicitly so
+      // operators can correlate any startup load spike with this event.
+      console.warn(
+        `[imclaw-bridge] cold start: no persisted dedup state for clawId=${this.config.clawId ?? '(unset)'}; ` +
+        `each subscribed topic will replay up to COLD_SUBSCRIBE_LIMIT messages of history. ` +
+        `Watch [tinode-client] subscribe logs for total topic count, and runtime dispatch ` +
+        `throughput. Subsequent restarts will use persisted since-seq and not replay history.`,
+      );
     }
     await this.client.connect();
     console.log('IMClaw: connected to Tinode');
@@ -363,6 +395,19 @@ export class ImclawBridge {
 
   setTopicLimit(topic: string, limit: number): void {
     this.client.setTopicLimit(topic, limit);
+  }
+
+  /**
+   * Send a Tinode {note} packet for inbound message lifecycle feedback.
+   * Used by the channel layer to signal:
+   *  - recv: "I received your seq=N message" (on dispatch start)
+   *  - kp:   "I'm working on it" (typing indicator, refresh every ~3s during dispatch)
+   *  - read: "I'm done processing seq=N" (on dispatch end, success OR failure OR timeout)
+   *
+   * Best-effort; never throws.
+   */
+  sendNote(topic: string, what: 'recv' | 'read' | 'kp', seq?: number): void {
+    try { this.client.sendNote(topic, what, seq); } catch { /* best-effort */ }
   }
 
   getPeerName(uid: string): string | undefined {
