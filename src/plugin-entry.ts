@@ -87,13 +87,34 @@ function ensureToolsProfile(api: OpenClawPluginApi) {
     const allow: string[] | null = Array.isArray(tools?.allow) ? tools.allow : null;
     const alsoAllow: string[] | null = Array.isArray(tools?.alsoAllow) ? tools.alsoAllow : null;
 
-    const persist = () => {
-      const freshCfg = typeof (api.runtime!.config as any).current === 'function'
-        ? (api.runtime!.config as any).current()
-        : cfg;
-      (api.runtime!.config as any).writeConfigFile(freshCfg).catch((err: any) => {
+    // Persist a focused tools-policy mutation. OpenClaw >=2026.5 deprecated the
+    // whole-config writeConfigFile() (and flags it for blocking in bundled
+    // plugins), so prefer the host-serialized mutateConfigFile() — a focused
+    // mutation that won't clobber concurrent writers such as `plugins enable`.
+    // Older runtimes (<=2026.4) without mutateConfigFile fall back to the legacy
+    // whole-config write. The mutation is also applied to the in-memory snapshot
+    // so the running process reflects it immediately.
+    const persist = (mutate: (draft: Record<string, any>) => void) => {
+      try {
+        mutate(cfg);
+      } catch {
+        // snapshot may be frozen on some runtimes — the authoritative write below still applies it
+      }
+      const cfgApi = api.runtime!.config as any;
+      const onErr = (err: any) =>
         api.logger.warn(`[imclaw] failed to persist tools policy fix: ${err?.message ?? err}`);
-      });
+
+      if (typeof cfgApi.mutateConfigFile === 'function') {
+        Promise.resolve(
+          cfgApi.mutateConfigFile({ afterWrite: { mode: 'auto' }, mutate }),
+        ).catch(onErr);
+        return;
+      }
+      if (typeof cfgApi.writeConfigFile === 'function') {
+        Promise.resolve(cfgApi.writeConfigFile(cfg)).catch(onErr);
+        return;
+      }
+      api.logger.warn('[imclaw] runtime config API unavailable — cannot persist tools policy fix');
     };
 
     // Case ①: no allow — additive opt-in via tools.alsoAllow.
@@ -103,12 +124,13 @@ function ensureToolsProfile(api: OpenClawPluginApi) {
       const missing = declaredTools.filter((t) => !existing.includes(t));
       if (missing.length === 0) return;
       const next = Array.from(new Set([...existing, ...declaredTools]));
-      const toolsObj = (cfg.tools = cfg.tools ?? {});
-      toolsObj.alsoAllow = next;
       api.logger.info(
         `[imclaw] enabled ${missing.length} imclaw tool(s) via tools.alsoAllow`,
       );
-      persist();
+      persist((draft) => {
+        const toolsObj = (draft.tools = draft.tools ?? {});
+        toolsObj.alsoAllow = next;
+      });
       return;
     }
 
@@ -116,18 +138,22 @@ function ensureToolsProfile(api: OpenClawPluginApi) {
     // mixing allow + alsoAllow). Replace with real tool names in place.
     const imclawIdx = allow.indexOf('imclaw');
     if (imclawIdx !== -1) {
+      const nextAllow = allow.slice();
       if (Array.isArray(declaredTools) && declaredTools.length > 0) {
-        allow.splice(imclawIdx, 1, ...declaredTools);
+        nextAllow.splice(imclawIdx, 1, ...declaredTools);
         api.logger.info(
           `[imclaw] replaced bare "imclaw" in tools.allow with ${declaredTools.length} declared tool names`,
         );
       } else {
-        allow.splice(imclawIdx, 1);
+        nextAllow.splice(imclawIdx, 1);
         api.logger.warn(
           `[imclaw] removed non-matching "imclaw" from tools.allow — declare contracts.tools in manifest for auto-fix`,
         );
       }
-      persist();
+      persist((draft) => {
+        const toolsObj = (draft.tools = draft.tools ?? {});
+        toolsObj.allow = nextAllow;
+      });
       return;
     }
 
