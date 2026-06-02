@@ -992,8 +992,22 @@ function registerMessageHandler(
           ctx: msgCtx,
           cfg: currentCfg,
           dispatcherOptions: {
-            deliver: async (payload: { text?: string; body?: string; mediaUrl?: string; mediaUrls?: string[] }) => {
-              log?.info?.(`[imclaw-channel] deliver callback: text=${(payload?.text || payload?.body || '').substring(0, 80)} mediaUrl=${payload?.mediaUrl || 'none'}`);
+            deliver: async (payload: { text?: string; body?: string; isError?: boolean; mediaUrl?: string; mediaUrls?: string[] }) => {
+              log?.info?.(`[imclaw-channel] deliver callback: text=${(payload?.text || payload?.body || '').substring(0, 80)} mediaUrl=${payload?.mediaUrl || 'none'} isError=${payload?.isError ? 1 : 0}`);
+              // Structured upstream-error signal: the OpenClaw runtime tags model-failure
+              // fallbacks (rate limit / billing / overloaded / auth / context overflow) with
+              // isError=true. These must never be published into a social topic — drop here
+              // rather than relying on after-the-fact text matching (shouldSuppressAgentBugText).
+              if (payload?.isError) {
+                const errText = (payload?.text ?? payload?.body)?.trim() || '';
+                // Preserve the recoverable-context retry trigger before dropping the text.
+                if (errText && isRecoverableSessionContextError(errText)) {
+                  thinkingErrorDetected = true;
+                  log?.warn?.(`[imclaw-channel] recoverable session context error in error-reply, will retry with new session`);
+                }
+                log?.warn?.(`[imclaw-channel] dropped upstream-error reply (isError) topic=${msg.topic}: ${errText.slice(0, 120)}`);
+                return;
+              }
               try {
                 const replyText = (payload?.text ?? payload?.body)?.trim();
                 if (replyText && isRecoverableSessionContextError(replyText)) {
@@ -1080,6 +1094,12 @@ function registerMessageHandler(
               } catch (deliverErr: any) {
                 log?.error?.(`[imclaw] deliver error ${msg.topic}: ${deliverErr.message}`);
               }
+            },
+            onError: (err: unknown, info: { kind: string }) => {
+              log?.warn?.(`[imclaw-channel] dispatch error kind=${info?.kind} topic=${msg.topic}: ${String((err as any)?.message ?? err)}`);
+            },
+            onSkip: (_payload: unknown, info: { kind: string; reason: string }) => {
+              log?.info?.(`[imclaw-channel] reply skipped kind=${info?.kind} reason=${info?.reason} topic=${msg.topic}`);
             },
           },
         });
@@ -2052,13 +2072,22 @@ export const imclawPlugin = {
             ctx: msgCtx,
             cfg: currentCfg,
             dispatcherOptions: {
-              deliver: async (payload: { text?: string; body?: string }) => {
+              deliver: async (payload: { text?: string; body?: string; isError?: boolean }) => {
+                // Structured upstream-error signal (rate limit / billing / overloaded / etc.):
+                // never collect an error fallback as the topic/plaza reply.
+                if (payload?.isError) {
+                  log?.warn?.(`[imclaw-internal] dropped upstream-error reply (isError): ${(payload?.text || payload?.body || '').slice(0, 120)}`);
+                  return;
+                }
                 const text = (payload?.text ?? payload?.body)?.trim();
                 if (text && !shouldSuppressAgentBugText(text)) {
                   collectedReply = text;
                 } else if (text) {
                   log?.warn?.(`[imclaw-internal] suppressed bug reply: ${text.slice(0, 120)}`);
                 }
+              },
+              onError: (err: unknown, info: { kind: string }) => {
+                log?.warn?.(`[imclaw-internal] dispatch error kind=${info?.kind}: ${String((err as any)?.message ?? err)}`);
               },
             },
           });

@@ -142,7 +142,7 @@ function ensureToolsProfile(api: OpenClawPluginApi) {
     if (!allow.includes('web_fetch') && !allow.includes('*')) {
       api.logger.warn(
         `[imclaw] tools.allow is in strict mode without "web_fetch" — IMClaw skills that use built-in fetch ` +
-        `(MBTI / SBTI / Texas Holdem) will fail. Add "web_fetch" to tools.allow if you want those skills available.`,
+        `(MBTI / Texas Holdem) will fail. Add "web_fetch" to tools.allow if you want those skills available.`,
       );
     }
   } catch {

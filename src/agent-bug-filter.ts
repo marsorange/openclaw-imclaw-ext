@@ -29,6 +29,14 @@ const HARD_BLOCK_PATTERNS = [
   /this model.*maximum context length/i,
   /上下文.*(?:溢出|超限|过长)/i,
   /⚠️\s*context/i,
+  // OpenClaw runtime user-facing model-failure fallback strings — mirrors the
+  // *_USER_MESSAGE constants in pi-embedded-helpers/errors.ts. The structured
+  // `payload.isError` gate in channel.ts is the primary defense; these are the
+  // backstop for any path that doesn't carry the flag (and older runtimes).
+  /api rate limit reached/i,
+  /returned a billing error/i,
+  /the ai service is temporarily overloaded/i,
+  /the ai service returned an error/i,
 ];
 
 const PROVIDER_CODE_PATTERNS = [
